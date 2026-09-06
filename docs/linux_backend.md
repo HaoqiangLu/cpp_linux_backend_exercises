@@ -4,16 +4,28 @@
 
 ## 1.1 vector 动态数组
 
-- **练习目标**：理解动态扩容机制；掌握 `size/capacity/push_back/reserve/resize` 的区别；熟练进行遍历与随机访问。
+- **练习目标**：
+    - 理解 `vector` 的底层内存模型与动态扩容机制（`size` vs `capacity`，1.5 倍增长策略）。
+    - 掌握 `push_back`/`emplace_back`/`pop_back`/`insert`/`erase`/`clear` 的用法与适用场景。
+    - 掌握 `reserve` 与 `resize` 的区别，理解何时需要预分配内存。
+    - 理解迭代器失效的场景，能正确处理删除/插入过程中的迭代器失效问题。
+    - 熟练使用下标访问、迭代器遍历与范围 for 循环进行随机访问与遍历。
 - **练习任务**：
     1. 输入若干整数存入 `vector<int>`，逆序输出。
     2. 统计 `vector<int>` 中的最大值、最小值、平均值。
     3. 删除 `vector` 中所有等于某个特定值的元素（注意迭代器失效问题）。
-    4. 实现“动态成绩表”：支持添加成绩、删除末尾成绩、打印全部、计算平均分。
+    4. 实现"动态成绩表"：支持添加成绩、删除末尾成绩、打印全部、计算平均分。
+    5. 演示 `emplace_back`、`insert`、`clear` 的用法，观察 `size` 与 `capacity` 的变化。
 - **巩固标准**：
-  - [ ] 能不看文档写出增删改查及遍历代码。
-  - [ ] 清晰区分 `push_back` 与 `emplace_back` 的性能差异。
-  - [ ] 知道何时必须使用 `reserve` 避免频繁扩容。
+  - [ ] 能不看文档独立完成练习任务 1-5 的全部功能实现。
+  - [ ] 能准确说出 `push_back` 与 `emplace_back` 在构造对象时的性能差异，并举出适用场景。
+    > **知识讲解**：`push_back` 先在外部构造临时对象，再拷贝/移动到容器尾部；`emplace_back` 直接在容器尾部原地构造，省去一次拷贝/移动。对于 `int` 等基础类型两者几乎无差异，但对于 `std::string`、自定义类等复杂对象，`emplace_back` 可以避免不必要的拷贝开销。适用场景：向容器中添加复杂对象时优先使用 `emplace_back`。
+  - [ ] 能在代码中正确使用 `reserve` 预分配内存，并解释其避免的扩容次数与拷贝开销。
+    > **知识讲解**：`reserve(n)` 预分配至少 n 个元素的内存空间，只改变 `capacity` 不改变 `size`。当已知元素数量时提前 `reserve`，可以避免 `vector` 多次扩容（每次约 1.5 倍）带来的重复全量拷贝。例如插入 1000 个元素，不 `reserve` 可能扩容约 17 次，`reserve(1000)` 则只需 1 次分配。
+  - [ ] 能解释练习 3 中迭代器失效的原因，并至少写出一种正确的删除方式（erase-remove 惯用法或手动迭代器递增控制）。
+    > **知识讲解**：`vector` 在 `insert`/`erase` 后，被修改位置之后的所有迭代器都会失效，因为元素在内存中被移动了。删除元素时如果仍用 `it++` 递增迭代器，会跳过元素或访问已失效的迭代器。正确方式：① erase-remove 惯用法——`std::remove` 将保留元素前移并返回新逻辑结尾，再 `erase` 删除尾部多余元素；② 手动迭代器控制——删除时不递增迭代器（`erase` 返回下一个有效迭代器），保留时才递增。
+  - [ ] 能说出 `vector` 扩容时的时间复杂度（均摊 O(1)）以及 `reserve` 与 `resize` 对 `size`/`capacity` 的不同影响。
+    > **知识讲解**：单次扩容时间复杂度为 O(n)（需拷贝所有旧元素），但由于 1.5 倍增长策略，均摊每次插入仍为 O(1)。`reserve(n)` 只改变 `capacity` 不改变 `size`，用于预分配内存；`resize(n)` 改变 `size`（可能也改变 `capacity`），用于增减实际元素数量——扩容时新元素值初始化，缩小时尾部元素被丢弃。
 
 <details>
 <summary>📦 练习框架代码</summary>
@@ -22,21 +34,22 @@
 // === 1.1 vector 练习框架 ===
 // 项目结构:
 // 1-1-vector/
-// ├── grade_book.h
-// ├── grade_book.cpp
-// ├── vector_exercises.h
-// ├── vector_exercises.cpp
+// ├── GradeBook.h
+// ├── GradeBook.cpp
+// ├── VectorExercises.h
+// ├── VectorExercises.cpp
 // └── main.cpp
 
-// ---------- grade_book.h ----------
+// ---------- GradeBook.h ----------
 #pragma once
 #include <vector>
 
 // 练习4: 动态成绩表
 class GradeBook {
 public:
-    void addGrade(double g);            // TODO: 添加成绩
+    void addGrade(double g);            // TODO: 添加成绩（使用 emplace_back）
     void removeLast();                  // TODO: 删除末尾成绩
+    void clear();                       // TODO: 清空所有成绩
     void printAll() const;              // TODO: 打印全部成绩
     double average() const;             // TODO: 计算并返回平均分
 
@@ -44,17 +57,21 @@ private:
     std::vector<double> grades_;
 };
 
-// ---------- grade_book.cpp ----------
-#include "grade_book.h"
+// ---------- GradeBook.cpp ----------
+#include "GradeBook.h"
 #include <iostream>
 #include <numeric>
 
 void GradeBook::addGrade(double g) {
-    // TODO: grades_.push_back(g)
+    // TODO: grades_.emplace_back(g)
 }
 
 void GradeBook::removeLast() {
     // TODO: 判空后 grades_.pop_back()
+}
+
+void GradeBook::clear() {
+    // TODO: grades_.clear()
 }
 
 void GradeBook::printAll() const {
@@ -66,7 +83,7 @@ double GradeBook::average() const {
     return 0.0;
 }
 
-// ---------- vector_exercises.h ----------
+// ---------- VectorExercises.h ----------
 #pragma once
 #include <vector>
 
@@ -79,8 +96,11 @@ void statistics(const std::vector<int>& v);
 // 练习3: 删除vector中所有等于target的元素（注意迭代器失效）
 void removeElement(std::vector<int>& v, int target);
 
-// ---------- vector_exercises.cpp ----------
-#include "vector_exercises.h"
+// 练习5: 演示 emplace_back、insert、clear 的用法
+void emplaceInsertClear();
+
+// ---------- VectorExercises.cpp ----------
+#include "VectorExercises.h"
 #include <algorithm>
 #include <iostream>
 #include <numeric>
@@ -102,12 +122,21 @@ void removeElement(std::vector<int>& v, int target) {
     // 提示: v.erase(std::remove(v.begin(), v.end(), target), v.end());
 }
 
+void emplaceInsertClear() {
+    std::vector<int> v{1, 2, 3};
+    // TODO: 使用 emplace_back 在尾部添加元素
+    // TODO: 使用 insert 在指定位置插入元素
+    // TODO: 观察 size 与 capacity 的变化
+    // TODO: 使用 clear 清空所有元素，观察 capacity 是否改变
+}
+
 // ---------- main.cpp ----------
-#include "grade_book.h"
-#include "vector_exercises.h"
+#include "GradeBook.h"
+#include "VectorExercises.h"
 
 int main() {
     // TODO: 调用以上函数与 GradeBook 进行测试
+    // 提示: 依次测试 reversePrint、statistics、removeElement、emplaceInsertClear、GradeBook
     return 0;
 }
 ```
@@ -135,11 +164,11 @@ int main() {
 // === 1.2 string 练习框架 ===
 // 项目结构:
 // 1-2-string/
-// ├── string_exercises.h
-// ├── string_exercises.cpp
+// ├── StringExercises.h
+// ├── StringExercises.cpp
 // └── main.cpp
 
-// ---------- string_exercises.h ----------
+// ---------- StringExercises.h ----------
 #pragma once
 #include <string>
 #include <vector>
@@ -159,8 +188,8 @@ std::string mostFrequentWord();
 // 练习5: 将"123,456,789"按逗号分割为多个子串
 std::vector<std::string> split(const std::string& s, char delim);
 
-// ---------- string_exercises.cpp ----------
-#include "string_exercises.h"
+// ---------- StringExercises.cpp ----------
+#include "StringExercises.h"
 
 #include <sstream>
 #include <unordered_map>
@@ -195,7 +224,7 @@ std::vector<std::string> split(const std::string& s, char delim) {
 }
 
 // ---------- main.cpp ----------
-#include "string_exercises.h"
+#include "StringExercises.h"
 
 int main() {
     // TODO: 调用以上函数进行测试
@@ -226,15 +255,15 @@ int main() {
 // === 1.3 map/unordered_map 练习框架 ===
 // 项目结构:
 // 1-3-map/
-// ├── student_lookup.h
-// ├── student_lookup.cpp
-// ├── phone_book.h
-// ├── phone_book.cpp
-// ├── map_exercises.h
-// ├── map_exercises.cpp
+// ├── StudentLookup.h
+// ├── StudentLookup.cpp
+// ├── PhoneBook.h
+// ├── PhoneBook.cpp
+// ├── MapExercises.h
+// ├── MapExercises.cpp
 // └── main.cpp
 
-// ---------- student_lookup.h ----------
+// ---------- StudentLookup.h ----------
 #pragma once
 #include <string>
 #include <unordered_map>
@@ -249,8 +278,8 @@ private:
     std::unordered_map<std::string, int> records_;
 };
 
-// ---------- student_lookup.cpp ----------
-#include "student_lookup.h"
+// ---------- StudentLookup.cpp ----------
+#include "StudentLookup.h"
 
 void StudentLookup::add(const std::string& name, int score) {
     // TODO: records_[name] = score
@@ -261,7 +290,7 @@ int StudentLookup::query(const std::string& name) const {
     return -1;
 }
 
-// ---------- phone_book.h ----------
+// ---------- PhoneBook.h ----------
 #pragma once
 #include <string>
 #include <unordered_map>
@@ -278,8 +307,8 @@ private:
     std::unordered_map<std::string, std::string> contacts_;        // name -> phone
 };
 
-// ---------- phone_book.cpp ----------
-#include "phone_book.h"
+// ---------- PhoneBook.cpp ----------
+#include "PhoneBook.h"
 #include <iostream>
 
 void PhoneBook::add(const std::string& name, const std::string& phone) {
@@ -299,7 +328,7 @@ void PhoneBook::printAll() const {
     // TODO: for (const auto& [name, phone] : contacts_) 打印
 }
 
-// ---------- map_exercises.h ----------
+// ---------- MapExercises.h ----------
 #pragma once
 #include <string>
 #include <unordered_map>
@@ -314,8 +343,8 @@ std::unordered_map<int, int> countFrequency(const std::vector<int>& nums);
 // 练习5: 解析日志，统计每个用户登录次数
 std::unordered_map<std::string, int> countLogins(const std::vector<std::string>& logLines);
 
-// ---------- map_exercises.cpp ----------
-#include "map_exercises.h"
+// ---------- MapExercises.cpp ----------
+#include "MapExercises.h"
 #include <sstream>
 
 std::unordered_map<std::string, int> wordCount(const std::string& text) {
@@ -337,9 +366,9 @@ std::unordered_map<std::string, int> countLogins(const std::vector<std::string>&
 }
 
 // ---------- main.cpp ----------
-#include "map_exercises.h"
-#include "phone_book.h"
-#include "student_lookup.h"
+#include "MapExercises.h"
+#include "PhoneBook.h"
+#include "StudentLookup.h"
 
 int main() {
     // TODO: 调用以上函数与类进行测试
@@ -372,11 +401,11 @@ int main() {
 // 1-4-set/
 // ├── blacklist.h
 // ├── blacklist.cpp
-// ├── set_exercises.h
-// ├── set_exercises.cpp
+// ├── SetExercises.h
+// ├── SetExercises.cpp
 // └── main.cpp
 
-// ---------- blacklist.h ----------
+// ---------- Blacklist.h ----------
 #pragma once
 #include <unordered_set>
 
@@ -391,8 +420,8 @@ private:
     std::unordered_set<int> ids_;
 };
 
-// ---------- blacklist.cpp ----------
-#include "blacklist.h"
+// ---------- Blacklist.cpp ----------
+#include "Blacklist.h"
 
 void Blacklist::add(int id) {
     // TODO: ids_.insert(id)
@@ -407,7 +436,7 @@ bool Blacklist::contains(int id) const {
     return false;
 }
 
-// ---------- set_exercises.h ----------
+// ---------- SetExercises.h ----------
 #pragma once
 #include <set>
 #include <string>
@@ -425,8 +454,8 @@ int uniqueWordCount(const std::string& text);
 // 练习5: 从一组数字中找出前K个不重复的数
 std::vector<int> topKUnique(const std::vector<int>& nums, int k);
 
-// ---------- set_exercises.cpp ----------
-#include "set_exercises.h"
+// ---------- SetExercises.cpp ----------
+#include "SetExercises.h"
 #include <sstream>
 #include <unordered_set>
 
@@ -453,8 +482,8 @@ std::vector<int> topKUnique(const std::vector<int>& nums, int k) {
 }
 
 // ---------- main.cpp ----------
-#include "blacklist.h"
-#include "set_exercises.h"
+#include "Blacklist.h"
+#include "SetExercises.h"
 
 int main() {
     // TODO: 调用以上函数与 Blacklist 进行测试
@@ -485,12 +514,12 @@ int main() {
 // === 1.5 标准算法与Lambda 练习框架 ===
 // 项目结构:
 // 1-5-algorithm/
-// ├── student.h
-// ├── algorithm_exercises.h
-// ├── algorithm_exercises.cpp
+// ├── Student.h
+// ├── AlgorithmExercises.h
+// ├── AlgorithmExercises.cpp
 // └── main.cpp
 
-// ---------- student.h ----------
+// ---------- Student.h ----------
 #pragma once
 #include <string>
 
@@ -499,11 +528,11 @@ struct Student {
     int score = 0;
 };
 
-// ---------- algorithm_exercises.h ----------
+// ---------- AlgorithmExercises.h ----------
 #pragma once
 #include <vector>
 
-#include "student.h"
+#include "Student.h"
 
 // 练习1: vector<int> 升序、降序排序
 void sortDemo(std::vector<int>& v);
@@ -520,8 +549,8 @@ void printAll(const std::vector<int>& v);
 // 练习5: 多种Lambda排序
 void customSorts(std::vector<int>& v);
 
-// ---------- algorithm_exercises.cpp ----------
-#include "algorithm_exercises.h"
+// ---------- AlgorithmExercises.cpp ----------
+#include "AlgorithmExercises.h"
 
 #include <algorithm>
 #include <cmath>
@@ -552,7 +581,7 @@ void customSorts(std::vector<int>& v) {
 }
 
 // ---------- main.cpp ----------
-#include "algorithm_exercises.h"
+#include "AlgorithmExercises.h"
 
 int main() {
     // TODO: 调用以上函数进行测试
@@ -584,13 +613,13 @@ int main() {
 
 // ================================================================
 // 项目 A：1-6-a-grade-manager/
-//   ├── student.h
-//   ├── grade_manager.h
-//   ├── grade_manager.cpp
+//   ├── Student.h
+//   ├── GradeManager.h
+//   ├── GradeManager.cpp
 //   └── main.cpp
 // ================================================================
 
-// ---------- student.h ----------
+// ---------- Student.h ----------
 #pragma once
 #include <string>
 
@@ -599,12 +628,12 @@ struct Student {
     double score = 0.0;
 };
 
-// ---------- grade_manager.h ----------
+// ---------- GradeManager.h ----------
 #pragma once
 #include <string>
 #include <vector>
 
-#include "student.h"
+#include "Student.h"
 
 class GradeManager {
 public:
@@ -622,8 +651,8 @@ private:
     std::vector<Student> students_;
 };
 
-// ---------- grade_manager.cpp ----------
-#include "grade_manager.h"
+// ---------- GradeManager.cpp ----------
+#include "GradeManager.h"
 
 #include <algorithm>
 #include <iostream>
@@ -632,7 +661,7 @@ private:
 // TODO: 实现以上成员函数
 
 // ---------- main.cpp ----------
-#include "grade_manager.h"
+#include "GradeManager.h"
 
 int main() {
     // TODO: 实例化 GradeManager 并测试全部功能
@@ -641,12 +670,12 @@ int main() {
 
 // ================================================================
 // 项目 B：1-6-b-word-frequency/
-//   ├── word_frequency.h
-//   ├── word_frequency.cpp
+//   ├── WordFrequency.h
+//   ├── WordFrequency.cpp
 //   └── main.cpp
 // ================================================================
 
-// ---------- word_frequency.h ----------
+// ---------- WordFrequency.h ----------
 #pragma once
 #include <string>
 #include <unordered_map>
@@ -663,8 +692,8 @@ private:
     std::unordered_map<std::string, int> freq_;
 };
 
-// ---------- word_frequency.cpp ----------
-#include "word_frequency.h"
+// ---------- WordFrequency.cpp ----------
+#include "WordFrequency.h"
 
 #include <algorithm>
 #include <cctype>
@@ -674,7 +703,7 @@ private:
 // TODO: 实现以上成员函数
 
 // ---------- main.cpp ----------
-#include "word_frequency.h"
+#include "WordFrequency.h"
 
 int main() {
     // TODO: 实例化 WordFrequency 并测试全部功能
@@ -683,13 +712,13 @@ int main() {
 
 // ================================================================
 // 项目 C：1-6-c-task-manager/
-//   ├── task.h
-//   ├── task_manager.h
-//   ├── task_manager.cpp
+//   ├── Task.h
+//   ├── TaskManager.h
+//   ├── TaskManager.cpp
 //   └── main.cpp
 // ================================================================
 
-// ---------- task.h ----------
+// ---------- Task.h ----------
 #pragma once
 #include <string>
 
@@ -700,12 +729,12 @@ struct Task {
     bool done = false;
 };
 
-// ---------- task_manager.h ----------
+// ---------- TaskManager.h ----------
 #pragma once
 #include <string>
 #include <vector>
 
-#include "task.h"
+#include "Task.h"
 
 class TaskManager {
 public:
@@ -720,8 +749,8 @@ private:
     int nextId_ = 1;
 };
 
-// ---------- task_manager.cpp ----------
-#include "task_manager.h"
+// ---------- TaskManager.cpp ----------
+#include "TaskManager.h"
 
 #include <algorithm>
 #include <iostream>
@@ -729,7 +758,7 @@ private:
 // TODO: 实现以上成员函数
 
 // ---------- main.cpp ----------
-#include "task_manager.h"
+#include "TaskManager.h"
 
 int main() {
     // TODO: 实例化 TaskManager 并测试全部功能
@@ -763,11 +792,11 @@ int main() {
 // === 2.1 auto 练习框架 ===
 // 项目结构:
 // 2-1-auto/
-// ├── auto_exercises.h
-// ├── auto_exercises.cpp
+// ├── AutoExercises.h
+// ├── AutoExercises.cpp
 // └── main.cpp
 
-// ---------- auto_exercises.h ----------
+// ---------- AutoExercises.h ----------
 #pragma once
 #include <map>
 #include <string>
@@ -782,8 +811,8 @@ void autoMapDemo(const std::map<std::string, int>& m);
 // 练习3: 函数返回 vector<int>，调用方用 auto 接收
 std::vector<int> generateData(int n);
 
-// ---------- auto_exercises.cpp ----------
-#include "auto_exercises.h"
+// ---------- AutoExercises.cpp ----------
+#include "AutoExercises.h"
 #include <iostream>
 
 void autoIteratorDemo(const std::vector<int>& v) {
@@ -802,7 +831,7 @@ std::vector<int> generateData(int n) {
 }
 
 // ---------- main.cpp ----------
-#include "auto_exercises.h"
+#include "AutoExercises.h"
 #include <iostream>
 
 int main() {
@@ -832,11 +861,11 @@ int main() {
 // === 2.2 范围for 练习框架 ===
 // 项目结构:
 // 2-2-range-for/
-// ├── range_for_exercises.h
-// ├── range_for_exercises.cpp
+// ├── RangeForExercises.h
+// ├── RangeForExercises.cpp
 // └── main.cpp
 
-// ---------- range_for_exercises.h ----------
+// ---------- RangeForExercises.h ----------
 #pragma once
 #include <map>
 #include <string>
@@ -854,8 +883,8 @@ void printMap(const std::map<std::string, int>& m);
 // 练习4: 遍历 vector<string> 统计总字符数（const 引用避免拷贝）
 int totalChars(const std::vector<std::string>& v);
 
-// ---------- range_for_exercises.cpp ----------
-#include "range_for_exercises.h"
+// ---------- RangeForExercises.cpp ----------
+#include "RangeForExercises.h"
 #include <iostream>
 
 void printVector(const std::vector<int>& v) {
@@ -877,7 +906,7 @@ int totalChars(const std::vector<std::string>& v) {
 }
 
 // ---------- main.cpp ----------
-#include "range_for_exercises.h"
+#include "RangeForExercises.h"
 
 int main() {
     // TODO: 调用以上函数进行测试
@@ -908,12 +937,12 @@ int main() {
 // === 2.3 Lambda 练习框架 ===
 // 项目结构:
 // 2-3-lambda/
-// ├── student.h
-// ├── lambda_exercises.h
-// ├── lambda_exercises.cpp
+// ├── Student.h
+// ├── LambdaExercises.h
+// ├── LambdaExercises.cpp
 // └── main.cpp
 
-// ---------- student.h ----------
+// ---------- Student.h ----------
 #pragma once
 #include <string>
 
@@ -922,11 +951,11 @@ struct Student {
     int score = 0;
 };
 
-// ---------- lambda_exercises.h ----------
+// ---------- LambdaExercises.h ----------
 #pragma once
 #include <vector>
 
-#include "student.h"
+#include "Student.h"
 
 // 练习2: Lambda 降序排序
 void sortDescending(std::vector<int>& v);
@@ -940,8 +969,8 @@ int countAbove(const std::vector<int>& v, int threshold);
 // 练习5: sort + Lambda 对学生按分数排序
 void sortStudents(std::vector<Student>& students);
 
-// ---------- lambda_exercises.cpp ----------
-#include "lambda_exercises.h"
+// ---------- LambdaExercises.cpp ----------
+#include "LambdaExercises.h"
 
 #include <algorithm>
 
@@ -965,7 +994,7 @@ void sortStudents(std::vector<Student>& students) {
 }
 
 // ---------- main.cpp ----------
-#include "lambda_exercises.h"
+#include "LambdaExercises.h"
 #include <iostream>
 
 int main() {
@@ -1000,14 +1029,14 @@ int main() {
 // === 2.4 智能指针练习框架 ===
 // 项目结构:
 // 2-4-smart-pointer/
-// ├── list_node.h
-// ├── watcher.h
-// ├── watcher.cpp
-// ├── smart_pointer_exercises.h
-// ├── smart_pointer_exercises.cpp
+// ├── ListNode.h
+// ├── Watcher.h
+// ├── Watcher.cpp
+// ├── SmartPointerExercises.h
+// ├── SmartPointerExercises.cpp
 // └── main.cpp
 
-// ---------- list_node.h ----------
+// ---------- ListNode.h ----------
 #pragma once
 #include <memory>
 
@@ -1019,7 +1048,7 @@ struct ListNode {
     explicit ListNode(int v) : val(v), next(nullptr) {}
 };
 
-// ---------- watcher.h ----------
+// ---------- Watcher.h ----------
 #pragma once
 #include <string>
 
@@ -1034,8 +1063,8 @@ struct Watcher {
     std::string name;
 };
 
-// ---------- watcher.cpp ----------
-#include "watcher.h"
+// ---------- Watcher.cpp ----------
+#include "Watcher.h"
 #include <iostream>
 #include <utility>
 
@@ -1047,7 +1076,7 @@ Watcher::~Watcher() {
     std::cout << name << " destroyed\n";
 }
 
-// ---------- smart_pointer_exercises.h ----------
+// ---------- SmartPointerExercises.h ----------
 #pragma once
 
 // 练习1: unique_ptr 管理动态数组
@@ -1065,15 +1094,15 @@ void filePtrDemo();
 // 练习5: 析构打印验证释放时机
 void watchDemo();
 
-// ---------- smart_pointer_exercises.cpp ----------
-#include "smart_pointer_exercises.h"
+// ---------- SmartPointerExercises.cpp ----------
+#include "SmartPointerExercises.h"
 
 #include <cstdio>
 #include <iostream>
 #include <memory>
 
-#include "list_node.h"
-#include "watcher.h"
+#include "ListNode.h"
+#include "Watcher.h"
 
 void uniqueArrayDemo() {
     // TODO: auto arr = std::make_unique<int[]>(5);
@@ -1098,7 +1127,7 @@ void watchDemo() {
 }
 
 // ---------- main.cpp ----------
-#include "smart_pointer_exercises.h"
+#include "SmartPointerExercises.h"
 
 int main() {
     // TODO: 调用以上函数进行测试
@@ -1129,15 +1158,15 @@ int main() {
 // === 2.5 右值引用与移动语义练习框架 ===
 // 项目结构:
 // 2-5-move-semantics/
-// ├── resource.h
-// ├── resource.cpp
-// ├── my_string.h
-// ├── my_string.cpp
-// ├── move_exercises.h
-// ├── move_exercises.cpp
+// ├── Resource.h
+// ├── Resource.cpp
+// ├── MyString.h
+// ├── MyString.cpp
+// ├── MoveExercises.h
+// ├── MoveExercises.cpp
 // └── main.cpp
 
-// ---------- resource.h ----------
+// ---------- Resource.h ----------
 #pragma once
 #include <cstddef>
 
@@ -1159,8 +1188,8 @@ private:
     std::size_t size_ = 0;
 };
 
-// ---------- resource.cpp ----------
-#include "resource.h"
+// ---------- Resource.cpp ----------
+#include "Resource.h"
 #include <iostream>
 #include <utility>
 
@@ -1191,7 +1220,7 @@ Resource& Resource::operator=(Resource&& other) noexcept {
     return *this;
 }
 
-// ---------- my_string.h ----------
+// ---------- MyString.h ----------
 #pragma once
 
 // 练习5: MyString 类
@@ -1211,14 +1240,14 @@ private:
     char* data_ = nullptr;
 };
 
-// ---------- my_string.cpp ----------
-#include "my_string.h"
+// ---------- MyString.cpp ----------
+#include "MyString.h"
 #include <cstring>
 #include <utility>
 
 // TODO: 实现以上所有成员函数（注意 std::strlen + new char[n+1]）
 
-// ---------- move_exercises.h ----------
+// ---------- MoveExercises.h ----------
 #pragma once
 
 // 练习3: std::move 转移 vector/string
@@ -1227,8 +1256,8 @@ void moveDemo();
 // 练习4: 对比拷贝与移动性能
 void benchmark();
 
-// ---------- move_exercises.cpp ----------
-#include "move_exercises.h"
+// ---------- MoveExercises.cpp ----------
+#include "MoveExercises.h"
 
 #include <chrono>
 #include <iostream>
@@ -1247,9 +1276,9 @@ void benchmark() {
 }
 
 // ---------- main.cpp ----------
-#include "move_exercises.h"
-#include "my_string.h"
-#include "resource.h"
+#include "MoveExercises.h"
+#include "MyString.h"
+#include "Resource.h"
 
 int main() {
     // TODO: 调用以上函数与类进行测试
@@ -1276,14 +1305,14 @@ int main() {
 // === 2.6 现代C++综合练习框架 ===
 // 项目结构:
 // 2-6-modern-cpp/
-// ├── resource.h
-// ├── resource_manager.h
-// ├── resource_manager.cpp
-// ├── modern_exercises.h
-// ├── modern_exercises.cpp
+// ├── Resource.h
+// ├── ResourceManager.h
+// ├── ResourceManager.cpp
+// ├── ModernExercises.h
+// ├── ModernExercises.cpp
 // └── main.cpp
 
-// ---------- resource.h ----------
+// ---------- Resource.h ----------
 #pragma once
 #include <string>
 
@@ -1293,13 +1322,13 @@ struct Resource {
     int priority = 0;
 };
 
-// ---------- resource_manager.h ----------
+// ---------- ResourceManager.h ----------
 #pragma once
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "resource.h"
+#include "Resource.h"
 
 // 练习C: 小型资源管理器
 class ResourceManager {
@@ -1313,8 +1342,8 @@ private:
     std::vector<std::unique_ptr<Resource>> resources_;
 };
 
-// ---------- resource_manager.cpp ----------
-#include "resource_manager.h"
+// ---------- ResourceManager.cpp ----------
+#include "ResourceManager.h"
 
 #include <algorithm>
 #include <iostream>
@@ -1337,7 +1366,7 @@ void ResourceManager::filterByType(const std::string& type) const {
     // TODO: std::for_each + Lambda 过滤并打印指定 type 的资源
 }
 
-// ---------- modern_exercises.h ----------
+// ---------- ModernExercises.h ----------
 #pragma once
 
 // 练习A: 智能指针重写旧代码
@@ -1346,8 +1375,8 @@ void smartPtrRewrite();
 // 练习B: Lambda + 算法重写循环
 void lambdaRewrite();
 
-// ---------- modern_exercises.cpp ----------
-#include "modern_exercises.h"
+// ---------- ModernExercises.cpp ----------
+#include "ModernExercises.h"
 
 #include <algorithm>
 #include <iostream>
@@ -1367,8 +1396,8 @@ void lambdaRewrite() {
 }
 
 // ---------- main.cpp ----------
-#include "modern_exercises.h"
-#include "resource_manager.h"
+#include "ModernExercises.h"
+#include "ResourceManager.h"
 
 int main() {
     // TODO: 调用以上函数与 ResourceManager 进行测试
@@ -1403,15 +1432,15 @@ int main() {
 // === 3.1 类与封装练习框架 ===
 // 项目结构:
 // 3-1-encapsulation/
-// ├── student.h
-// ├── student.cpp
-// ├── bank_account.h
-// ├── bank_account.cpp
-// ├── rectangle.h
-// ├── rectangle.cpp
+// ├── Student.h
+// ├── Student.cpp
+// ├── BankAccount.h
+// ├── BankAccount.cpp
+// ├── Rectangle.h
+// ├── Rectangle.cpp
 // └── main.cpp
 
-// ---------- student.h ----------
+// ---------- Student.h ----------
 #pragma once
 #include <string>
 
@@ -1427,8 +1456,8 @@ private:
     double score_ = 0.0;
 };
 
-// ---------- student.cpp ----------
-#include "student.h"
+// ---------- Student.cpp ----------
+#include "Student.h"
 #include <iostream>
 #include <utility>
 
@@ -1439,7 +1468,7 @@ void Student::printInfo() const {
     // TODO: 打印 name_ / age_ / score_
 }
 
-// ---------- bank_account.h ----------
+// ---------- BankAccount.h ----------
 #pragma once
 
 // 练习2&4: BankAccount 类
@@ -1455,8 +1484,8 @@ private:
     double balance_ = 0.0;             // 私有：余额
 };
 
-// ---------- bank_account.cpp ----------
-#include "bank_account.h"
+// ---------- BankAccount.cpp ----------
+#include "BankAccount.h"
 
 BankAccount::BankAccount(double init) : balance_(init) {}
 
@@ -1475,7 +1504,7 @@ double BankAccount::getBalance() const {
     return 0.0;
 }
 
-// ---------- rectangle.h ----------
+// ---------- Rectangle.h ----------
 #pragma once
 
 // 练习3: Rectangle 类
@@ -1490,8 +1519,8 @@ private:
     double height_ = 0.0;
 };
 
-// ---------- rectangle.cpp ----------
-#include "rectangle.h"
+// ---------- Rectangle.cpp ----------
+#include "Rectangle.h"
 
 Rectangle::Rectangle(double w, double h) : width_(w), height_(h) {}
 
@@ -1506,9 +1535,9 @@ double Rectangle::perimeter() const {
 }
 
 // ---------- main.cpp ----------
-#include "bank_account.h"
-#include "rectangle.h"
-#include "student.h"
+#include "BankAccount.h"
+#include "Rectangle.h"
+#include "Student.h"
 
 int main() {
     // TODO: 实例化以上类并测试各接口
@@ -1539,15 +1568,15 @@ int main() {
 // === 3.2 构造与析构练习框架 ===
 // 项目结构:
 // 3-2-ctor-dtor/
-// ├── lifecycle.h
-// ├── lifecycle.cpp
-// ├── dyn_array.h
-// ├── dyn_array.cpp
-// ├── my_string.h
-// ├── my_string.cpp
+// ├── Lifecycle.h
+// ├── Lifecycle.cpp
+// ├── DynArray.h
+// ├── DynArray.cpp
+// ├── MyString.h
+// ├── MyString.cpp
 // └── main.cpp
 
-// ---------- lifecycle.h ----------
+// ---------- Lifecycle.h ----------
 #pragma once
 #include <string>
 
@@ -1561,8 +1590,8 @@ private:
     std::string tag_;
 };
 
-// ---------- lifecycle.cpp ----------
-#include "lifecycle.h"
+// ---------- Lifecycle.cpp ----------
+#include "Lifecycle.h"
 #include <iostream>
 #include <utility>
 
@@ -1574,7 +1603,7 @@ Lifecycle::~Lifecycle() {
     std::cout << "[析构] " << tag_ << '\n';
 }
 
-// ---------- dyn_array.h ----------
+// ---------- DynArray.h ----------
 #pragma once
 #include <cstddef>
 
@@ -1593,8 +1622,8 @@ private:
     std::size_t size_ = 0;
 };
 
-// ---------- dyn_array.cpp ----------
-#include "dyn_array.h"
+// ---------- DynArray.cpp ----------
+#include "DynArray.h"
 
 DynArray::DynArray(std::size_t n) {
     // TODO: data_ = new int[n]{}; size_ = n;
@@ -1613,7 +1642,7 @@ DynArray& DynArray::operator=(const DynArray& other) {
     return *this;
 }
 
-// ---------- my_string.h ----------
+// ---------- MyString.h ----------
 #pragma once
 
 // 练习5: MyString 类
@@ -1630,8 +1659,8 @@ private:
     char* data_ = nullptr;
 };
 
-// ---------- my_string.cpp ----------
-#include "my_string.h"
+// ---------- MyString.cpp ----------
+#include "MyString.h"
 #include <cstring>
 
 MyString::MyString(const char* s) {
@@ -1652,9 +1681,9 @@ MyString& MyString::operator=(const MyString& other) {
 }
 
 // ---------- main.cpp ----------
-#include "dyn_array.h"
-#include "lifecycle.h"
-#include "my_string.h"
+#include "DynArray.h"
+#include "Lifecycle.h"
+#include "MyString.h"
 
 int main() {
     // TODO: 创建对象数组，观察构造/析构顺序
@@ -1684,23 +1713,23 @@ int main() {
 // === 3.3 继承练习框架 ===
 // 项目结构:
 // 3-3-inheritance/
-// ├── animal.h
-// ├── animal.cpp
-// ├── dog.h
-// ├── dog.cpp
-// ├── cat.h
-// ├── cat.cpp
-// ├── shape.h
-// ├── shape.cpp
-// ├── circle.h
-// ├── circle.cpp
-// ├── rectangle.h
-// ├── rectangle.cpp
-// ├── triangle.h
-// ├── triangle.cpp
+// ├── Animal.h
+// ├── Animal.cpp
+// ├── Dog.h
+// ├── Dog.cpp
+// ├── Cat.h
+// ├── Cat.cpp
+// ├── Shape.h
+// ├── Shape.cpp
+// ├── Circle.h
+// ├── Circle.cpp
+// ├── Rectangle.h
+// ├── Rectangle.cpp
+// ├── Triangle.h
+// ├── Triangle.cpp
 // └── main.cpp
 
-// ---------- animal.h ----------
+// ---------- Animal.h ----------
 #pragma once
 #include <string>
 
@@ -1717,8 +1746,8 @@ protected:
     int age_ = 0;
 };
 
-// ---------- animal.cpp ----------
-#include "animal.h"
+// ---------- Animal.cpp ----------
+#include "Animal.h"
 #include <iostream>
 #include <utility>
 
@@ -1728,11 +1757,11 @@ void Animal::printInfo() const {
     // TODO: 输出 name_ 与 age_
 }
 
-// ---------- dog.h ----------
+// ---------- Dog.h ----------
 #pragma once
 #include <string>
 
-#include "animal.h"
+#include "Animal.h"
 
 // 练习2: Dog 派生
 class Dog : public Animal {
@@ -1745,8 +1774,8 @@ private:
     std::string breed_;
 };
 
-// ---------- dog.cpp ----------
-#include "dog.h"
+// ---------- Dog.cpp ----------
+#include "Dog.h"
 #include <iostream>
 #include <utility>
 
@@ -1761,11 +1790,11 @@ void Dog::bark() const {
     // TODO: std::cout << "汪汪\n";
 }
 
-// ---------- cat.h ----------
+// ---------- Cat.h ----------
 #pragma once
 #include <string>
 
-#include "animal.h"
+#include "Animal.h"
 
 class Cat : public Animal {
 public:
@@ -1777,8 +1806,8 @@ private:
     bool isIndoor_ = false;
 };
 
-// ---------- cat.cpp ----------
-#include "cat.h"
+// ---------- Cat.cpp ----------
+#include "Cat.h"
 #include <iostream>
 #include <utility>
 
@@ -1793,7 +1822,7 @@ void Cat::meow() const {
     // TODO: std::cout << "喵喵\n";
 }
 
-// ---------- shape.h ----------
+// ---------- Shape.h ----------
 #pragma once
 
 // 练习3: Shape 体系抽象基类
@@ -1805,17 +1834,17 @@ public:
     virtual void printInfo() const;
 };
 
-// ---------- shape.cpp ----------
-#include "shape.h"
+// ---------- Shape.cpp ----------
+#include "Shape.h"
 #include <iostream>
 
 void Shape::printInfo() const {
     std::cout << "Shape\n";
 }
 
-// ---------- circle.h ----------
+// ---------- Circle.h ----------
 #pragma once
-#include "shape.h"
+#include "Shape.h"
 
 class Circle : public Shape {
 public:
@@ -1826,8 +1855,8 @@ private:
     double radius_ = 0.0;
 };
 
-// ---------- circle.cpp ----------
-#include "circle.h"
+// ---------- Circle.cpp ----------
+#include "Circle.h"
 #include <cmath>
 
 Circle::Circle(double r) : radius_(r) {}
@@ -1837,9 +1866,9 @@ double Circle::area() const {
     return 0.0;
 }
 
-// ---------- rectangle.h ----------
+// ---------- Rectangle.h ----------
 #pragma once
-#include "shape.h"
+#include "Shape.h"
 
 class Rectangle : public Shape {
 public:
@@ -1851,8 +1880,8 @@ private:
     double height_ = 0.0;
 };
 
-// ---------- rectangle.cpp ----------
-#include "rectangle.h"
+// ---------- Rectangle.cpp ----------
+#include "Rectangle.h"
 
 Rectangle::Rectangle(double w, double h) : width_(w), height_(h) {}
 
@@ -1861,9 +1890,9 @@ double Rectangle::area() const {
     return 0.0;
 }
 
-// ---------- triangle.h ----------
+// ---------- Triangle.h ----------
 #pragma once
-#include "shape.h"
+#include "Shape.h"
 
 class Triangle : public Shape {
 public:
@@ -1875,8 +1904,8 @@ private:
     double height_ = 0.0;
 };
 
-// ---------- triangle.cpp ----------
-#include "triangle.h"
+// ---------- Triangle.cpp ----------
+#include "Triangle.h"
 
 Triangle::Triangle(double b, double h) : base_(b), height_(h) {}
 
@@ -1886,11 +1915,11 @@ double Triangle::area() const {
 }
 
 // ---------- main.cpp ----------
-#include "cat.h"
-#include "circle.h"
-#include "dog.h"
-#include "rectangle.h"
-#include "triangle.h"
+#include "Cat.h"
+#include "Circle.h"
+#include "Dog.h"
+#include "Rectangle.h"
+#include "Triangle.h"
 
 int main() {
     // TODO: 测试各派生类的 printInfo 和 area
@@ -1922,40 +1951,40 @@ int main() {
 // 项目结构:
 // 3-4-polymorphism/
 // ├── shape.h                       （复用 3.3 的 Shape/Circle/Rectangle/Triangle）
-// ├── shape.cpp
-// ├── poly_demo.h
-// ├── poly_demo.cpp
-// ├── employee.h
-// ├── employee.cpp
-// ├── manager.h
-// ├── manager.cpp
-// ├── developer.h
-// ├── developer.cpp
-// ├── logger.h
-// ├── logger.cpp
-// ├── file_logger.h
-// ├── file_logger.cpp
-// ├── console_logger.h
-// ├── console_logger.cpp
+// ├── Shape.cpp
+// ├── PolyDemo.h
+// ├── PolyDemo.cpp
+// ├── Employee.h
+// ├── Employee.cpp
+// ├── Manager.h
+// ├── Manager.cpp
+// ├── Developer.h
+// ├── Developer.cpp
+// ├── Logger.h
+// ├── Logger.cpp
+// ├── FileLogger.h
+// ├── FileLogger.cpp
+// ├── ConsoleLogger.h
+// ├── ConsoleLogger.cpp
 // └── main.cpp
 
-// ---------- poly_demo.h ----------
+// ---------- PolyDemo.h ----------
 #pragma once
 
 // 练习1&2: 图形面积多态体系（复用 3.3 的 Shape/Circle/Rectangle/Triangle）
 void polyDemo();
 
-// ---------- poly_demo.cpp ----------
-#include "poly_demo.h"
+// ---------- PolyDemo.cpp ----------
+#include "PolyDemo.h"
 
 #include <iostream>
 #include <memory>
 #include <vector>
 
-#include "circle.h"
-#include "rectangle.h"
-#include "shape.h"
-#include "triangle.h"
+#include "Circle.h"
+#include "Rectangle.h"
+#include "Shape.h"
+#include "Triangle.h"
 
 void polyDemo() {
     std::vector<std::unique_ptr<Shape>> shapes;
@@ -1963,7 +1992,7 @@ void polyDemo() {
     // TODO: 遍历调用 area()，观察多态行为
 }
 
-// ---------- employee.h ----------
+// ---------- Employee.h ----------
 #pragma once
 #include <string>
 
@@ -1980,8 +2009,8 @@ protected:
     std::string name_;
 };
 
-// ---------- employee.cpp ----------
-#include "employee.h"
+// ---------- Employee.cpp ----------
+#include "Employee.h"
 #include <iostream>
 #include <utility>
 
@@ -1991,11 +2020,11 @@ void Employee::printInfo() const {
     // TODO: 输出 name_ 与 calcSalary()
 }
 
-// ---------- manager.h ----------
+// ---------- Manager.h ----------
 #pragma once
 #include <string>
 
-#include "employee.h"
+#include "Employee.h"
 
 class Manager : public Employee {
 public:
@@ -2006,8 +2035,8 @@ private:
     double baseSalary_ = 0.0;
 };
 
-// ---------- manager.cpp ----------
-#include "manager.h"
+// ---------- Manager.cpp ----------
+#include "Manager.h"
 #include <utility>
 
 Manager::Manager(std::string n, double base)
@@ -2018,11 +2047,11 @@ double Manager::calcSalary() const {
     return 0.0;
 }
 
-// ---------- developer.h ----------
+// ---------- Developer.h ----------
 #pragma once
 #include <string>
 
-#include "employee.h"
+#include "Employee.h"
 
 class Developer : public Employee {
 public:
@@ -2034,8 +2063,8 @@ private:
     double hourlyRate_ = 0.0;
 };
 
-// ---------- developer.cpp ----------
-#include "developer.h"
+// ---------- Developer.cpp ----------
+#include "Developer.h"
 #include <utility>
 
 Developer::Developer(std::string n, int h, double rate)
@@ -2046,7 +2075,7 @@ double Developer::calcSalary() const {
     return 0.0;
 }
 
-// ---------- logger.h ----------
+// ---------- Logger.h ----------
 #pragma once
 #include <string>
 
@@ -2057,11 +2086,11 @@ public:
     virtual void log(const std::string& msg) const = 0;
 };
 
-// ---------- file_logger.h ----------
+// ---------- FileLogger.h ----------
 #pragma once
 #include <string>
 
-#include "logger.h"
+#include "Logger.h"
 
 class FileLogger : public Logger {
 public:
@@ -2072,8 +2101,8 @@ private:
     std::string filename_;
 };
 
-// ---------- file_logger.cpp ----------
-#include "file_logger.h"
+// ---------- FileLogger.cpp ----------
+#include "FileLogger.h"
 #include <fstream>
 #include <utility>
 
@@ -2083,17 +2112,17 @@ void FileLogger::log(const std::string& msg) const {
     // TODO: std::ofstream ofs(filename_, std::ios::app); ofs << msg << '\n';
 }
 
-// ---------- console_logger.h ----------
+// ---------- ConsoleLogger.h ----------
 #pragma once
-#include "logger.h"
+#include "Logger.h"
 
 class ConsoleLogger : public Logger {
 public:
     void log(const std::string& msg) const override;   // TODO: 输出到控制台
 };
 
-// ---------- console_logger.cpp ----------
-#include "console_logger.h"
+// ---------- ConsoleLogger.cpp ----------
+#include "ConsoleLogger.h"
 #include <iostream>
 
 void ConsoleLogger::log(const std::string& msg) const {
@@ -2101,11 +2130,11 @@ void ConsoleLogger::log(const std::string& msg) const {
 }
 
 // ---------- main.cpp ----------
-#include "console_logger.h"
-#include "developer.h"
-#include "file_logger.h"
-#include "manager.h"
-#include "poly_demo.h"
+#include "ConsoleLogger.h"
+#include "Developer.h"
+#include "FileLogger.h"
+#include "Manager.h"
+#include "PolyDemo.h"
 
 #include <memory>
 #include <vector>
@@ -2137,13 +2166,13 @@ int main() {
 // === 3.5 虚析构函数练习框架 ===
 // 项目结构:
 // 3-5-virtual-dtor/
-// ├── base.h
-// ├── base.cpp
-// ├── derived.h
-// ├── derived.cpp
+// ├── Base.h
+// ├── Base.cpp
+// ├── Derived.h
+// ├── Derived.cpp
 // └── main.cpp
 
-// ---------- base.h ----------
+// ---------- Base.h ----------
 #pragma once
 
 // 练习1: 基类/派生类均动态分配资源
@@ -2159,8 +2188,8 @@ protected:
     int* data_ = nullptr;
 };
 
-// ---------- base.cpp ----------
-#include "base.h"
+// ---------- Base.cpp ----------
+#include "Base.h"
 #include <iostream>
 
 Base::Base(int val) : data_(new int(val)) {
@@ -2172,9 +2201,9 @@ Base::~Base() {
     std::cout << "[Base 析构]\n";
 }
 
-// ---------- derived.h ----------
+// ---------- Derived.h ----------
 #pragma once
-#include "base.h"
+#include "Base.h"
 
 class Derived : public Base {
 public:
@@ -2185,8 +2214,8 @@ private:
     int* extra_ = nullptr;
 };
 
-// ---------- derived.cpp ----------
-#include "derived.h"
+// ---------- Derived.cpp ----------
+#include "Derived.h"
 #include <iostream>
 
 Derived::Derived(int val, int extraVal) : Base(val), extra_(new int(extraVal)) {
@@ -2199,8 +2228,8 @@ Derived::~Derived() {
 }
 
 // ---------- main.cpp ----------
-#include "base.h"
-#include "derived.h"
+#include "Base.h"
+#include "Derived.h"
 
 int main() {
     // 练习2: 基类指针 new 派生类后 delete
@@ -2233,16 +2262,16 @@ int main() {
 
 // ================================================================
 // 项目 A：3-6-a-shape-system/
-//   ├── shape.h
-//   ├── shape.cpp
-//   ├── circle.h / circle.cpp
-//   ├── rectangle.h / rectangle.cpp
-//   ├── triangle.h / triangle.cpp
-//   ├── shape_manager.h / shape_manager.cpp
+//   ├── Shape.h
+//   ├── Shape.cpp
+//   ├── circle.h / Circle.cpp
+//   ├── Rectangle.h / Rectangle.cpp
+//   ├── triangle.h / Triangle.cpp
+//   ├── ShapeManager.h / ShapeManager.cpp
 //   └── main.cpp
 // ================================================================
 
-// ---------- shape.h ----------
+// ---------- Shape.h ----------
 #pragma once
 
 class Shape {
@@ -2254,9 +2283,9 @@ public:
     virtual void printInfo() const = 0;
 };
 
-// ---------- circle.h ----------
+// ---------- Circle.h ----------
 #pragma once
-#include "shape.h"
+#include "Shape.h"
 
 class Circle : public Shape {
 public:
@@ -2269,9 +2298,9 @@ private:
     double radius_ = 0.0;
 };
 
-// ---------- rectangle.h ----------
+// ---------- Rectangle.h ----------
 #pragma once
-#include "shape.h"
+#include "Shape.h"
 
 class Rectangle : public Shape {
 public:
@@ -2285,9 +2314,9 @@ private:
     double h_ = 0.0;
 };
 
-// ---------- triangle.h ----------
+// ---------- Triangle.h ----------
 #pragma once
-#include "shape.h"
+#include "Shape.h"
 
 class Triangle : public Shape {
 public:
@@ -2302,12 +2331,12 @@ private:
     double c_ = 0.0;
 };
 
-// ---------- shape_manager.h ----------
+// ---------- ShapeManager.h ----------
 #pragma once
 #include <memory>
 #include <vector>
 
-#include "shape.h"
+#include "Shape.h"
 
 class ShapeManager {
 public:
@@ -2319,8 +2348,8 @@ private:
     std::vector<std::unique_ptr<Shape>> shapes_;
 };
 
-// ---------- shape_manager.cpp ----------
-#include "shape_manager.h"
+// ---------- ShapeManager.cpp ----------
+#include "ShapeManager.h"
 #include <utility>
 
 void ShapeManager::add(std::unique_ptr<Shape> s) {
@@ -2337,10 +2366,10 @@ double ShapeManager::totalArea() const {
 }
 
 // ---------- main.cpp ----------
-#include "circle.h"
-#include "rectangle.h"
-#include "shape_manager.h"
-#include "triangle.h"
+#include "Circle.h"
+#include "Rectangle.h"
+#include "ShapeManager.h"
+#include "Triangle.h"
 
 #include <memory>
 
@@ -2351,14 +2380,14 @@ int main() {
 
 // ================================================================
 // 项目 B：3-6-b-employee-system/
-//   ├── employee.h / employee.cpp
-//   ├── manager.h / manager.cpp
-//   ├── programmer.h / programmer.cpp
-//   ├── employee_manager.h / employee_manager.cpp
+//   ├── Employee.h / Employee.cpp
+//   ├── Manager.h / Manager.cpp
+//   ├── Programmer.h / Programmer.cpp
+//   ├── EmployeeManager.h / EmployeeManager.cpp
 //   └── main.cpp
 // ================================================================
 
-// ---------- employee.h ----------
+// ---------- Employee.h ----------
 #pragma once
 #include <string>
 
@@ -2374,11 +2403,11 @@ protected:
     std::string name_;
 };
 
-// ---------- manager.h ----------
+// ---------- Manager.h ----------
 #pragma once
 #include <string>
 
-#include "employee.h"
+#include "Employee.h"
 
 class Manager : public Employee {
 public:
@@ -2389,11 +2418,11 @@ private:
     double baseSalary_ = 0.0;
 };
 
-// ---------- programmer.h ----------
+// ---------- Programmer.h ----------
 #pragma once
 #include <string>
 
-#include "employee.h"
+#include "Employee.h"
 
 class Programmer : public Employee {
 public:
@@ -2405,12 +2434,12 @@ private:
     double rate_ = 0.0;
 };
 
-// ---------- employee_manager.h ----------
+// ---------- EmployeeManager.h ----------
 #pragma once
 #include <memory>
 #include <vector>
 
-#include "employee.h"
+#include "Employee.h"
 
 class EmployeeManager {
 public:
@@ -2423,9 +2452,9 @@ private:
 };
 
 // ---------- main.cpp ----------
-#include "employee_manager.h"
-#include "manager.h"
-#include "programmer.h"
+#include "EmployeeManager.h"
+#include "Manager.h"
+#include "Programmer.h"
 
 int main() {
     // TODO: 实例化 EmployeeManager，添加多种员工并测试全部功能
@@ -2434,20 +2463,20 @@ int main() {
 
 // ================================================================
 // 项目 C：3-6-c-log-system/
-//   ├── log_level.h
-//   ├── logger.h
-//   ├── file_logger.h / file_logger.cpp
-//   ├── console_logger.h / console_logger.cpp
-//   ├── log_system.h / log_system.cpp
+//   ├── LogLevel.h
+//   ├── Logger.h
+//   ├── FileLogger.h / FileLogger.cpp
+//   ├── ConsoleLogger.h / ConsoleLogger.cpp
+//   ├── LogSystem.h / LogSystem.cpp
 //   └── main.cpp
 // ================================================================
 
-// ---------- log_level.h ----------
+// ---------- LogLevel.h ----------
 #pragma once
 
 enum class LogLevel { INFO, WARN, ERROR };
 
-// ---------- logger.h ----------
+// ---------- Logger.h ----------
 #pragma once
 #include <string>
 
@@ -2457,11 +2486,11 @@ public:
     virtual void write(const std::string& msg) const = 0;
 };
 
-// ---------- file_logger.h ----------
+// ---------- FileLogger.h ----------
 #pragma once
 #include <string>
 
-#include "logger.h"
+#include "Logger.h"
 
 class FileLogger : public Logger {
 public:
@@ -2472,23 +2501,23 @@ private:
     std::string filename_;
 };
 
-// ---------- console_logger.h ----------
+// ---------- ConsoleLogger.h ----------
 #pragma once
-#include "logger.h"
+#include "Logger.h"
 
 class ConsoleLogger : public Logger {
 public:
     void write(const std::string& msg) const override;   // TODO: 输出到 std::cout
 };
 
-// ---------- log_system.h ----------
+// ---------- LogSystem.h ----------
 #pragma once
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "log_level.h"
-#include "logger.h"
+#include "LogLevel.h"
+#include "Logger.h"
 
 class LogSystem {
 public:
@@ -2502,9 +2531,9 @@ private:
 };
 
 // ---------- main.cpp ----------
-#include "console_logger.h"
-#include "file_logger.h"
-#include "log_system.h"
+#include "ConsoleLogger.h"
+#include "FileLogger.h"
+#include "LogSystem.h"
 
 #include <memory>
 
@@ -2544,13 +2573,13 @@ int main() {
 // === 4.1 文件I/O练习框架 ===
 // 项目结构:
 // 4-1-file-io/
-// ├── file_io_exercises.h
-// ├── file_io_exercises.cpp
-// ├── config_parser.h
-// ├── config_parser.cpp
+// ├── FileIoExercises.h
+// ├── FileIoExercises.cpp
+// ├── ConfigParser.h
+// ├── ConfigParser.cpp
 // └── main.cpp
 
-// ---------- file_io_exercises.h ----------
+// ---------- FileIoExercises.h ----------
 #pragma once
 #include <string>
 #include <sys/types.h>
@@ -2570,8 +2599,8 @@ void readLines(const std::string& filename);
 // 练习5: 日志写入（追加模式）
 void writeLog(const std::string& filename, const std::string& msg);
 
-// ---------- file_io_exercises.cpp ----------
-#include "file_io_exercises.h"
+// ---------- FileIoExercises.cpp ----------
+#include "FileIoExercises.h"
 
 #include <fcntl.h>
 #include <fstream>
@@ -2602,7 +2631,7 @@ void writeLog(const std::string& filename, const std::string& msg) {
     // TODO: open(filename.c_str(), O_WRONLY|O_CREAT|O_APPEND)，write，close
 }
 
-// ---------- config_parser.h ----------
+// ---------- ConfigParser.h ----------
 #pragma once
 #include <string>
 #include <unordered_map>
@@ -2610,8 +2639,8 @@ void writeLog(const std::string& filename, const std::string& msg) {
 // 练习6: 简易配置文件解析器（key=value）
 std::unordered_map<std::string, std::string> parseConfig(const std::string& filename);
 
-// ---------- config_parser.cpp ----------
-#include "config_parser.h"
+// ---------- ConfigParser.cpp ----------
+#include "ConfigParser.h"
 #include <fstream>
 
 std::unordered_map<std::string, std::string> parseConfig(const std::string& filename) {
@@ -2621,8 +2650,8 @@ std::unordered_map<std::string, std::string> parseConfig(const std::string& file
 }
 
 // ---------- main.cpp ----------
-#include "config_parser.h"
-#include "file_io_exercises.h"
+#include "ConfigParser.h"
+#include "FileIoExercises.h"
 
 int main() {
     // TODO: 调用以上函数进行测试
@@ -2653,13 +2682,13 @@ int main() {
 // === 4.2 进程练习框架 ===
 // 项目结构:
 // 4-2-process/
-// ├── process_exercises.h
-// ├── process_exercises.cpp
-// ├── mini_shell.h
-// ├── mini_shell.cpp
+// ├── ProcessExercises.h
+// ├── ProcessExercises.cpp
+// ├── MiniShell.h
+// ├── MiniShell.cpp
 // └── main.cpp
 
-// ---------- process_exercises.h ----------
+// ---------- ProcessExercises.h ----------
 #pragma once
 
 // 练习1: fork 创建子进程，分别打印 PID
@@ -2674,8 +2703,8 @@ void execDemo();
 // 练习5: 验证 fork 后父子进程变量独立性
 void forkIndependence();
 
-// ---------- process_exercises.cpp ----------
-#include "process_exercises.h"
+// ---------- ProcessExercises.cpp ----------
+#include "ProcessExercises.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -2722,14 +2751,14 @@ void forkIndependence() {
     }
 }
 
-// ---------- mini_shell.h ----------
+// ---------- MiniShell.h ----------
 #pragma once
 
 // 练习4: 简易 Shell
 void miniShell();
 
-// ---------- mini_shell.cpp ----------
-#include "mini_shell.h"
+// ---------- MiniShell.cpp ----------
+#include "MiniShell.h"
 
 #include <cstring>
 #include <iostream>
@@ -2748,8 +2777,8 @@ void miniShell() {
 }
 
 // ---------- main.cpp ----------
-#include "mini_shell.h"
-#include "process_exercises.h"
+#include "MiniShell.h"
+#include "ProcessExercises.h"
 
 int main() {
     // TODO: 调用以上函数进行测试
@@ -2780,11 +2809,11 @@ int main() {
 // === 4.3 线程练习框架 ===
 // 项目结构:
 // 4-3-thread/
-// ├── thread_exercises.h
-// ├── thread_exercises.cpp
+// ├── ThreadExercises.h
+// ├── ThreadExercises.cpp
 // └── main.cpp
 
-// ---------- thread_exercises.h ----------
+// ---------- ThreadExercises.h ----------
 #pragma once
 #include <string>
 
@@ -2798,8 +2827,8 @@ void raceDemo();
 // 练习5: 下载模拟器
 void downloadSimulator(const std::string& filename, int numChunks, int numThreads);
 
-// ---------- thread_exercises.cpp ----------
-#include "thread_exercises.h"
+// ---------- ThreadExercises.cpp ----------
+#include "ThreadExercises.h"
 
 #include <iostream>
 #include <thread>
@@ -2830,7 +2859,7 @@ void downloadSimulator(const std::string& filename, int numChunks, int numThread
 }
 
 // ---------- main.cpp ----------
-#include "thread_exercises.h"
+#include "ThreadExercises.h"
 
 int main() {
     // 练习2: 一线程输入、一线程处理
@@ -2867,14 +2896,14 @@ int main() {
 // === 4.4 互斥锁与条件变量练习框架 ===
 // 项目结构:
 // 4-4-mutex-cv/
-// ├── safe_queue.h
-// ├── simple_thread_pool.h
-// ├── simple_thread_pool.cpp
-// ├── sync_exercises.h
-// ├── sync_exercises.cpp
+// ├── SafeQueue.h
+// ├── SimpleThreadPool.h
+// ├── SimpleThreadPool.cpp
+// ├── SyncExercises.h
+// ├── SyncExercises.cpp
 // └── main.cpp
 
-// ---------- safe_queue.h ----------
+// ---------- SafeQueue.h ----------
 #pragma once
 #include <mutex>
 #include <queue>
@@ -2903,7 +2932,7 @@ private:
     mutable std::mutex mtx_;
 };
 
-// ---------- simple_thread_pool.h ----------
+// ---------- SimpleThreadPool.h ----------
 #pragma once
 #include <condition_variable>
 #include <functional>
@@ -2931,8 +2960,8 @@ private:
     bool stop_ = false;
 };
 
-// ---------- simple_thread_pool.cpp ----------
-#include "simple_thread_pool.h"
+// ---------- SimpleThreadPool.cpp ----------
+#include "SimpleThreadPool.h"
 #include <utility>
 
 SimpleThreadPool::SimpleThreadPool(int numThreads) {
@@ -2948,7 +2977,7 @@ void SimpleThreadPool::submit(std::function<void()> task) {
     // TODO: std::lock_guard + tasks_.push(std::move(task)) + cv_.notify_one()
 }
 
-// ---------- sync_exercises.h ----------
+// ---------- SyncExercises.h ----------
 #pragma once
 
 // 练习1: mutex 保护累加操作
@@ -2957,8 +2986,8 @@ void safeAccumulate();
 // 练习3: 完整生产者消费者
 void producerConsumer();
 
-// ---------- sync_exercises.cpp ----------
-#include "sync_exercises.h"
+// ---------- SyncExercises.cpp ----------
+#include "SyncExercises.h"
 
 #include <condition_variable>
 #include <iostream>
@@ -3003,9 +3032,9 @@ void producerConsumer() {
 }
 
 // ---------- main.cpp ----------
-#include "safe_queue.h"
-#include "simple_thread_pool.h"
-#include "sync_exercises.h"
+#include "SafeQueue.h"
+#include "SimpleThreadPool.h"
+#include "SyncExercises.h"
 
 int main() {
     // TODO: 调用以上函数与类进行测试
@@ -3036,30 +3065,30 @@ int main() {
 // === 4.5 Socket练习框架 ===
 // 项目结构:
 // 4-5-socket/
-// ├── net_constants.h
-// ├── echo_server.h / echo_server.cpp
-// ├── echo_client.h / echo_client.cpp
-// ├── chat_server.h / chat_server.cpp
-// ├── multi_client_server.h / multi_client_server.cpp
-// ├── http_server.h / http_server.cpp
-// ├── cmd_server.h / cmd_server.cpp
+// ├── NetConstants.h
+// ├── EchoServer.h / EchoServer.cpp
+// ├── EchoClient.h / EchoClient.cpp
+// ├── ChatServer.h / ChatServer.cpp
+// ├── MultiClientServer.h / MultiClientServer.cpp
+// ├── HttpServer.h / HttpServer.cpp
+// ├── CmdServer.h / CmdServer.cpp
 // └── main.cpp
 
-// ---------- net_constants.h ----------
+// ---------- NetConstants.h ----------
 #pragma once
 
 inline constexpr int PORT = 8080;
 inline constexpr int BUF_SIZE = 1024;
 
-// ---------- echo_server.h ----------
+// ---------- EchoServer.h ----------
 #pragma once
 
 // 练习1: TCP 回声服务器
 void echoServer();
 
-// ---------- echo_server.cpp ----------
-#include "echo_server.h"
-#include "net_constants.h"
+// ---------- EchoServer.cpp ----------
+#include "EchoServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -3080,14 +3109,14 @@ void echoServer() {
     ::close(server_fd);
 }
 
-// ---------- echo_client.h ----------
+// ---------- EchoClient.h ----------
 #pragma once
 
 void echoClient();
 
-// ---------- echo_client.cpp ----------
-#include "echo_client.h"
-#include "net_constants.h"
+// ---------- EchoClient.cpp ----------
+#include "EchoClient.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -3103,16 +3132,16 @@ void echoClient() {
     ::close(fd);
 }
 
-// ---------- chat_server.h ----------
+// ---------- ChatServer.h ----------
 #pragma once
 
 // 练习2: TCP 聊天（服务器端 + 客户端）
 void chatServer();
 void chatClient();
 
-// ---------- chat_server.cpp ----------
-#include "chat_server.h"
-#include "net_constants.h"
+// ---------- ChatServer.cpp ----------
+#include "ChatServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <iostream>
@@ -3129,15 +3158,15 @@ void chatClient() {
     // TODO: 同时 recv 显示消息 + 发送用户输入
 }
 
-// ---------- multi_client_server.h ----------
+// ---------- MultiClientServer.h ----------
 #pragma once
 
 // 练习3: 多客户端服务器
 void multiClientServer();
 
-// ---------- multi_client_server.cpp ----------
-#include "multi_client_server.h"
-#include "net_constants.h"
+// ---------- MultiClientServer.cpp ----------
+#include "MultiClientServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <iostream>
@@ -3155,15 +3184,15 @@ void multiClientServer() {
     }
 }
 
-// ---------- http_server.h ----------
+// ---------- HttpServer.h ----------
 #pragma once
 
 // 练习4: 简易 HTTP 服务器
 void httpServer();
 
-// ---------- http_server.cpp ----------
-#include "http_server.h"
-#include "net_constants.h"
+// ---------- HttpServer.cpp ----------
+#include "HttpServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -3184,15 +3213,15 @@ void httpServer() {
     // TODO: send(response), close
 }
 
-// ---------- cmd_server.h ----------
+// ---------- CmdServer.h ----------
 #pragma once
 
 // 练习5: 命令执行服务器
 void cmdServer();
 
-// ---------- cmd_server.cpp ----------
-#include "cmd_server.h"
-#include "net_constants.h"
+// ---------- CmdServer.cpp ----------
+#include "CmdServer.h"
+#include "NetConstants.h"
 
 #include <cstdio>
 #include <iostream>
@@ -3202,12 +3231,12 @@ void cmdServer() {
 }
 
 // ---------- main.cpp ----------
-#include "chat_server.h"
-#include "cmd_server.h"
-#include "echo_client.h"
-#include "echo_server.h"
-#include "http_server.h"
-#include "multi_client_server.h"
+#include "ChatServer.h"
+#include "CmdServer.h"
+#include "EchoClient.h"
+#include "EchoServer.h"
+#include "HttpServer.h"
+#include "MultiClientServer.h"
 
 int main() {
     // TODO: 选择服务器或客户端模式测试
@@ -3239,29 +3268,29 @@ int main() {
 // === 4.6 epoll练习框架 ===
 // 项目结构:
 // 4-6-epoll/
-// ├── net_constants.h
-// ├── select_server.h / select_server.cpp
-// ├── poll_server.h / poll_server.cpp
-// ├── epoll_server.h / epoll_server.cpp
-// ├── epoll_chat_server.h / epoll_chat_server.cpp
+// ├── NetConstants.h
+// ├── SelectServer.h / SelectServer.cpp
+// ├── PollServer.h / PollServer.cpp
+// ├── EpollServer.h / EpollServer.cpp
+// ├── EpollChatServer.h / EpollChatServer.cpp
 // └── main.cpp
 
-// ---------- net_constants.h ----------
+// ---------- NetConstants.h ----------
 #pragma once
 
 inline constexpr int PORT = 8080;
 inline constexpr int BUF_SIZE = 1024;
 inline constexpr int MAX_EVENTS = 1024;
 
-// ---------- select_server.h ----------
+// ---------- SelectServer.h ----------
 #pragma once
 
 // 练习1: select 多客户端服务器
 void selectServer();
 
-// ---------- select_server.cpp ----------
-#include "select_server.h"
-#include "net_constants.h"
+// ---------- SelectServer.cpp ----------
+#include "SelectServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -3278,15 +3307,15 @@ void selectServer() {
     // TODO: FD_ZERO / FD_SET 初始化，select 循环，遍历 fd_set 处理新连接和数据
 }
 
-// ---------- poll_server.h ----------
+// ---------- PollServer.h ----------
 #pragma once
 
 // 练习2: poll 多客户端服务器
 void pollServer();
 
-// ---------- poll_server.cpp ----------
-#include "poll_server.h"
-#include "net_constants.h"
+// ---------- PollServer.cpp ----------
+#include "PollServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -3304,7 +3333,7 @@ void pollServer() {
     // TODO: poll 循环，处理 POLLIN 事件
 }
 
-// ---------- epoll_server.h ----------
+// ---------- EpollServer.h ----------
 #pragma once
 
 // 练习3: epoll 多客户端服务器（LT 模式）
@@ -3316,9 +3345,9 @@ void epollServerET();
 // 练习6: 非阻塞 epoll 服务器
 void nonBlockingEpollServer();
 
-// ---------- epoll_server.cpp ----------
-#include "epoll_server.h"
-#include "net_constants.h"
+// ---------- EpollServer.cpp ----------
+#include "EpollServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -3357,15 +3386,15 @@ void nonBlockingEpollServer() {
     // TODO: ET 模式下循环 read/write 直到 EAGAIN
 }
 
-// ---------- epoll_chat_server.h ----------
+// ---------- EpollChatServer.h ----------
 #pragma once
 
 // 练习5: epoll 聊天服务器
 void epollChatServer();
 
-// ---------- epoll_chat_server.cpp ----------
-#include "epoll_chat_server.h"
-#include "net_constants.h"
+// ---------- EpollChatServer.cpp ----------
+#include "EpollChatServer.h"
+#include "NetConstants.h"
 
 #include <arpa/inet.h>
 #include <iostream>
@@ -3380,10 +3409,10 @@ void epollChatServer() {
 }
 
 // ---------- main.cpp ----------
-#include "epoll_chat_server.h"
-#include "epoll_server.h"
-#include "poll_server.h"
-#include "select_server.h"
+#include "EpollChatServer.h"
+#include "EpollServer.h"
+#include "PollServer.h"
+#include "SelectServer.h"
 
 int main() {
     // TODO: 选择一种模式启动服务器测试
