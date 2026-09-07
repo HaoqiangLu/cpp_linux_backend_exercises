@@ -154,8 +154,11 @@ int main() {
     5. 将 `"123,456,789"` 按逗号分割为多个子串。
 - **巩固标准**：
   - [ ] 不再习惯性使用 `char[]`、`strcpy`、`strcat`。
+    > **知识讲解**：C 风格字符串（`char[]`）需要手动管理内存、计算长度，且 `strcpy`/`strcat` 不检查缓冲区边界，容易导致缓冲区溢出。`std::string` 自动管理内存，提供 `size()`/`length()` 获取长度，`+`/`+=` 拼接，`find()`/`substr()` 查找截取，所有操作都有边界安全保障。养成"默认用 `std::string`，只在对接 C API 时才用 `c_str()`"的习惯。
   - [ ] 自然使用 `find`、`substr`、`s +=` 等操作。
+    > **知识讲解**：`find(sub)` 返回子串首次出现的位置（未找到返回 `std::string::npos`），可配合 `substr(pos, len)` 截取任意片段；`s += "xxx"` 是最高效的拼接方式之一（原地追加，避免创建临时对象）；`s.insert(pos, str)` 在指定位置插入；`s.replace(pos, len, str)` 替换指定范围内容。这些操作都基于 `size_t` 位置索引，比手动操作指针安全直观得多。
   - [ ] 理解 SSO（Small String Optimization）对性能的影响。
+    > **知识讲解**：SSO 是 `std::string` 的底层优化机制——string 对象内部预留一块固定大小的栈缓冲区（通常 15~22 字节，取决于标准库实现）。当字符串长度 ≤ 缓冲区大小时，数据直接存在栈上，**零堆分配**；超过时才退回到堆上 `new`/`delete`。这意味着短字符串（如 `"hello"`、变量名、短命令等）的构造、拷贝、析构几乎无额外开销。`sizeof(std::string)` 通常为 32 字节（64 位系统），比直觉中的"指针+大小+容量=24 字节"更大，多出的空间正是给 SSO 用的。在高频操作短字符串的场景（解析、哈希表 key、日志拼接）中，SSO 是 `std::string` 性能远超 C 风格字符串手动 `malloc` 的关键原因。
 
 <details>
 <summary>📦 练习框架代码</summary>
@@ -362,6 +365,8 @@ std::unordered_map<int, int> countFrequency(const std::vector<int>& nums) {
 std::unordered_map<std::string, int> countLogins(const std::vector<std::string>& logLines) {
     std::unordered_map<std::string, int> loginCount;
     // TODO: 解析每行提取用户名，loginCount[user]++
+    // 日志格式: "[2024-01-15 10:30:00] user:alice login"
+    // 提示: 找到 "user:" 前缀，截取到下一个空格之间的部分即为用户名
     return loginCount;
 }
 
