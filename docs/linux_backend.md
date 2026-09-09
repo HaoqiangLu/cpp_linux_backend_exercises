@@ -248,8 +248,11 @@ int main() {
     5. 解析日志文件，统计每个用户的登录次数。
 - **巩固标准**：
   - [ ] 能根据场景正确选择 `map` 或 `unordered_map`。
+    > **知识讲解**：`std::map` 底层是红黑树，元素按 key 有序排列，插入/查找/删除时间复杂度均为 O(log n)，适合需要有序遍历、范围查询（`lower_bound`/`upper_bound`）的场景。`std::unordered_map` 底层是哈希表，元素无序存储，平均插入/查找/删除为 O(1)，但最坏情况（哈希冲突严重）退化为 O(n)；且 `rehash` 时代价较高。选择原则：**需要有序或范围操作时用 `map`，其余场景优先用 `unordered_map`**（平均性能更优）。注意 `unordered_map` 的 key 类型需要提供 `std::hash` 特化或自定义哈希函数。
   - [ ] 熟练使用 `m[key]++`、`m.find()`、`m.at()`。
+    > **知识讲解**：`m[key]` 会在 key 不存在时**自动插入**一个值初始化的元素（对 `int` 即 0），因此 `m[key]++` 是统计词频的经典写法——首次访问自动初始化为 0 再自增。但这也意味着只读查询时误用 `m[key]` 会意外插入无用键值对，此时应使用 `m.find(key)`（返回迭代器，未找到返回 `m.end()`，不插入）或 `m.at(key)`（找到返回值引用，未找到抛出 `std::out_of_range` 异常）。总结：计数用 `m[key]++`，安全查询用 `m.find()` 或 `m.at()`，三者配合覆盖所有常见场景。
   - [ ] 能用范围 for + 结构化绑定（C++17）遍历键值对。
+    > **知识讲解**：C++17 引入的结构化绑定（Structured Bindings）允许 `for (const auto& [key, value] : m)` 直接解构 `map`/`unordered_map` 中的 `std::pair<const Key, Value>`，比 C++11 的 `it->first`/`it->second` 或 `auto& p; p.first` 更直观易读。注意迭代变量应使用 `const auto&` 避免不必要的拷贝（尤其是 value 为 `std::string` 等复杂类型时）；若需修改 value，去掉 `const` 即可（`for (auto& [key, value] : m)`），但 key 始终为 `const` 不可修改。
 
 <details>
 <summary>📦 练习框架代码</summary>
@@ -394,8 +397,11 @@ int main() {
     5. 从一组数字中找出前 K 个不重复的数。
 - **巩固标准**：
   - [ ] 能准确区分 `vector`、`map`、`set` 的适用边界。
+    > **知识讲解**：`vector` 适合有序索引访问和顺序存储场景，支持随机访问 O(1)，但不保证唯一性；`map` 适合键值对映射场景（如统计词频、按名字查分数），key 自动有序且唯一；`set` 适合纯集合操作（去重、交集、并集、成员判定），元素自动有序且唯一。选择原则：**需要“存在性判定+自动去重”用 `set`，需要“键→值”映射用 `map`，需要顺序存储或按位置访问用 `vector`**。若不需要有序性，优先选对应的 `unordered_` 版本以获得均摊 O(1) 性能。
   - [ ] 不再用数组+手动去重解决集合类问题。
+    > **知识讲解**：传统 C 风格做法是用数组存所有元素，再遍历一遍跳过重复值（通常需要先排序）。这种方式代码冗长、容易出错，且时间复杂度为 O(n log n)（排序）+ O(n)（去重）。使用 `std::set` 或 `std::unordered_set` 可以在插入时自动去重——`set` 插入时检查是否已存在，重复元素直接忽略，代码只需一行 `s.insert(x)`。`set` 版本复杂度为 O(n log n)，`unordered_set` 为均摊 O(n)，且代码更简洁、语义更清晰。
   - [ ] 理解 `count` 与 `find` 在语义和性能上的区别。
+    > **知识讲解**：`s.count(x)` 返回元素 x 在集合中的出现次数——对 `set`/`unordered_set` 结果只能是 0 或 1（元素唯一），对 `multiset`/`multimap` 则可能大于 1。`s.find(x)` 返回指向 x 的迭代器（未找到返回 `s.end()`），可以直接用于访问元素或作为删除操作的参数。性能上两者相同（都是 O(log n) 或均摊 O(1)），但语义不同：**只需判断“是否存在”用 `count`（返回布尔语义的 0/1），需要获取元素或做后续操作时用 `find`（返回迭代器）**。
 
 <details>
 <summary>📦 练习框架代码</summary>
@@ -404,8 +410,8 @@ int main() {
 // === 1.4 set/unordered_set 练习框架 ===
 // 项目结构:
 // 1-4-set/
-// ├── blacklist.h
-// ├── blacklist.cpp
+// ├── Blacklist.h
+// ├── Blacklist.cpp
 // ├── SetExercises.h
 // ├── SetExercises.cpp
 // └── main.cpp

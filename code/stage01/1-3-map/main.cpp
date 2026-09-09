@@ -4,7 +4,7 @@
 #include <iostream>
 
 int main() {
-    std::cout << "练习1 统计文章中每个单词出现次数" << std::endl;
+    /* std::cout << "练习1 统计文章中每个单词出现次数" << std::endl;
     std::string text{"hello Hello heLLo word Word era Era year"};
     std::unordered_map<std::string, int> wordFreq = wordCount(text);
     for (const auto& pair : wordFreq) {
@@ -34,5 +34,32 @@ int main() {
     std::unordered_map<std::string, int> loginCount = countLogins(logLines);
     for (const auto& pair : loginCount) {
         std::cout << "[" << pair.first << "]:" << pair.second << std::endl;
-    }
+    } */
+
+    /* std::cout << "========================\n";
+    std::cout << "练习4 简单电话本" << std::endl;
+    PhoneBook pb;
+
+    pb.add("alice", "12345674567");
+    pb.add("bob", "13212341234");
+    pb.add("charlie", "15067896789");
+    pb.add("alice", "12345674567");
+    pb.printAll();
+
+    pb.remove("bob");
+    pb.printAll();
+
+    std::cout << "查找 charlie 的电话号码: " << pb.lookup("charlie") << std::endl; */
+
+    std::cout << "========================\n";
+    std::cout << "练习5 学生分数" << std::endl;
+
+    StudentLookup sl;
+    sl.add("alice", 95.5);
+    sl.add("bob", 85.0);
+    sl.add("charlie", 78.5);
+
+    std::cout << "alice 的分数是: " << sl.query("alice") << std::endl;
+    std::cout << "bob 的分数是: " << sl.query("bob") << std::endl;
+    std::cout << "charlie 的分数是: " << sl.query("charlie") << std::endl;
 }
