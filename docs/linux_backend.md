@@ -1975,7 +1975,6 @@ int main() {
 // ├── Developer.h
 // ├── Developer.cpp
 // ├── Logger.h
-// ├── Logger.cpp
 // ├── FileLogger.h
 // ├── FileLogger.cpp
 // ├── ConsoleLogger.h
@@ -2277,10 +2276,9 @@ int main() {
 // ================================================================
 // 项目 A：3-6-a-shape-system/
 //   ├── Shape.h
-//   ├── Shape.cpp
-//   ├── circle.h / Circle.cpp
+//   ├── Circle.h / Circle.cpp
 //   ├── Rectangle.h / Rectangle.cpp
-//   ├── triangle.h / Triangle.cpp
+//   ├── Triangle.h / Triangle.cpp
 //   ├── ShapeManager.h / ShapeManager.cpp
 //   └── main.cpp
 // ================================================================
