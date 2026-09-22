@@ -1,0 +1,4 @@
+Hello, this is a test file.
+Line 2: file IO exercises.
+Line 3: copy, cat, readLines.
+Line 4: end of file.
