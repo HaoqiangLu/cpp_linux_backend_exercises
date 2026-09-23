@@ -2565,7 +2565,7 @@ int main() {
 
 ## 4.1 文件 I/O
 
-- **练习目标**：掌握 Linux 文件操作；理解文件描述符；区分系统调用与标准 I/O。
+- **练习目标**：掌握 C++ 标准文件流操作（`ifstream`/`ofstream`/`fstream`）；理解文件打开模式与流状态；了解 C++ 文件流底层对应的 POSIX 系统调用。
 - **练习任务**：
     1. 实现简化版 `cp`：复制文件。
     2. 实现简化版 `cat`：打印文件内容。
@@ -2574,9 +2574,9 @@ int main() {
     5. 日志写入文件，支持追加模式。
     6. 实现简易配置文件解析器（key=value 格式）。
 - **巩固标准**：
-  - [ ] 能用 `open/read/write/close` 完成基本文件操作。
-  - [ ] 理解文件描述符的本质与继承规则。
-  - [ ] 知道何时用系统调用、何时用 stdio。
+  - [ ] 能用 `std::ifstream`/`std::ofstream` 完成基本文件读写操作。
+  - [ ] 理解文件打开模式（`binary`/`app`/`trunc`/`in`/`out`）的含义与组合。
+  - [ ] 知道 C++ 文件流与底层 POSIX 系统调用（`open/read/write`）的对应关系。
 
 <details>
 <summary>📦 练习框架代码</summary>
@@ -2594,7 +2594,6 @@ int main() {
 // ---------- FileIoExercises.h ----------
 #pragma once
 #include <string>
-#include <sys/types.h>
 
 // 练习1: 简化版 cp（复制文件）
 void copyFile(const std::string& src, const std::string& dst);
@@ -2603,7 +2602,7 @@ void copyFile(const std::string& src, const std::string& dst);
 void catFile(const std::string& filename);
 
 // 练习3: 统计文件大小
-off_t fileSize(const std::string& filename);
+std::streamsize fileSize(const std::string& filename);
 
 // 练习4: 逐行读取文本文件
 void readLines(const std::string& filename);
@@ -2614,33 +2613,32 @@ void writeLog(const std::string& filename, const std::string& msg);
 // ---------- FileIoExercises.cpp ----------
 #include "FileIoExercises.h"
 
-#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
 
 void copyFile(const std::string& src, const std::string& dst) {
-    // TODO: open 源文件(O_RDONLY)，open 目标文件(O_WRONLY|O_CREAT|O_TRUNC)
-    // TODO: 循环 read/write，完成后 close
+    // TODO: std::ifstream 以 binary 模式打开源文件
+    // TODO: std::ofstream 以 binary|trunc 模式打开目标文件
+    // TODO: 用 ofs << ifs.rdbuf() 完成复制
 }
 
 void catFile(const std::string& filename) {
-    // TODO: open 文件，循环 read 到 buffer，打印到 stdout，close
+    // TODO: std::ifstream 以 binary 模式打开文件
+    // TODO: std::cout << ifs.rdbuf() 打印内容
 }
 
-off_t fileSize(const std::string& filename) {
-    // TODO: 用 stat 或 lseek 获取文件大小
+std::streamsize fileSize(const std::string& filename) {
+    // TODO: std::ifstream 以 binary 模式打开，seekg 到末尾，tellg 获取大小
     return 0;
 }
 
 void readLines(const std::string& filename) {
-    // TODO: std::ifstream 逐行读取并打印
+    // TODO: std::ifstream 打开文件，std::getline 逐行读取并打印
 }
 
 void writeLog(const std::string& filename, const std::string& msg) {
-    // TODO: open(filename.c_str(), O_WRONLY|O_CREAT|O_APPEND)，write，close
+    // TODO: std::ofstream 以 out|app 模式打开文件，写入 msg
 }
 
 // ---------- ConfigParser.h ----------
@@ -2772,17 +2770,18 @@ void miniShell();
 // ---------- MiniShell.cpp ----------
 #include "MiniShell.h"
 
-#include <cstring>
 #include <iostream>
+#include <sstream>
+#include <string>
 #include <sys/wait.h>
 #include <unistd.h>
 
 void miniShell() {
-    char cmd[1024];
+    std::string cmd;
     while (true) {
         std::cout << "myshell> ";
-        // TODO: std::fgets 读取输入到 cmd
-        // TODO: std::strtok 解析命令和参数
+        // TODO: std::getline(std::cin, cmd) 读取输入
+        // TODO: std::istringstream 解析命令和参数
         // TODO: fork + exec 执行命令
         // TODO: 输入 "exit" 时退出
     }
@@ -2810,9 +2809,12 @@ int main() {
     4. 实现生产者消费者模型。
     5. 实现下载模拟器：多线程并行下载文件片段。
 - **巩固标准**：
-  - [ ] 理解多线程必须考虑同步，而非“写得快就对”。
+  - [ ] 理解多线程必须考虑同步，而非"写得快就对"。
+    > **知识讲解**：多线程并发写入共享变量时，`++counter` 看似一行代码，实际是"读→加→写"三步操作。两个线程可能同时读到相同的旧值，各自加 1 后写回，导致一次更新丢失。这就是**数据竞争（data race）**，属于未定义行为（UB）。解决方案：用 `std::mutex` + `std::lock_guard` 保护临界区，或使用 `std::atomic<int>` 让编译器生成原子指令。`raceDemo` 中 10 个线程各累加 100000 次，期望值 1000000，实际结果远小于此——缺失的数据正是被竞争覆盖的更新。
   - [ ] 知道 `join/detach` 的区别与必要性。
+    > **知识讲解**：`join()` 阻塞当前线程，等待目标线程执行完毕后才继续——用于"需要同步等待结果"的场景。`detach()` 将线程与 `std::thread` 对象分离，线程在后台独立运行，`std::thread` 对象变为不可连接状态——用于"不需要等待结果、后台独立运行"的场景。**必须二选一**：如果 `std::thread` 对象在析构时既没有 `join` 也没有 `detach`，程序会调用 `std::terminate()` 直接崩溃。常见错误：① 对已 `join`/`detach` 的线程再次操作（抛 `std::system_error`）；② `detach` 后线程访问了局部变量的引用（局部变量已析构，悬垂引用）。
   - [ ] 能识别常见的数据竞争场景。
+    > **知识讲解**：常见数据竞争场景：① 多线程同时 `++/--` 共享计数器（练习 3 `raceDemo`）；② 多线程同时写入 `std::cout`（练习 1 `multiPrintDemo` 中的行内撕裂 `[id 3[id ]: 308`，因为多次 `<<` 不是原子操作）；③ 多线程同时修改容器（`push_back`、`insert` 等）。识别方法：只要两个或以上线程**同时读写同一块内存**，且至少有一个是写操作，就存在数据竞争。解决方案：`std::mutex` 保护临界区、`std::atomic` 保护单变量、或改为线程局部存储避免共享。
 
 <details>
 <summary>📦 练习框架代码</summary>
@@ -2851,8 +2853,8 @@ void printNumbers(int id, int start, int end) {
 }
 
 void multiPrintDemo() {
-    // TODO: 创建多个 std::thread，各自调用 printNumbers
-    // TODO: join 所有线程
+    // TODO: 先用 join 演示——创建线程，join 等待其结束，观察主线程在子线程之后才继续
+    // TODO: 再用 detach 演示——创建线程，detach 分离，观察主线程不等待、子线程后台独立运行
 }
 
 void raceDemo() {

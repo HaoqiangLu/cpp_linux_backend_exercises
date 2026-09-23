@@ -1,6 +1,6 @@
 #pragma once
 #include <string>
-#include <sys/types.h>
+#include <ios>
 
 // 练习1：简化版 cp（复制文件）
 void copyFile(const std::string& src, const std::string& dst);
@@ -9,7 +9,7 @@ void copyFile(const std::string& src, const std::string& dst);
 void catFile(const std::string& filename);
 
 // 练习3：统计文件大小
-off_t fileSize(const std::string& filename);
+std::streamsize fileSize(const std::string& filename);
 
 // 练习4：逐行读取文本文件
 void readLines(const std::string& filename);

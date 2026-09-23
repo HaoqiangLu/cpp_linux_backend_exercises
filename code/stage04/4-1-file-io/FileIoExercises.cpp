@@ -1,11 +1,8 @@
 #include "FileIoExercises.h"
-#include <fcntl.h>
+
 #include <fstream>
-#include <ios>
 #include <iostream>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
 
 void copyFile(const std::string& src, const std::string& dst) {
     std::ifstream ifs(src, std::ios::binary);
