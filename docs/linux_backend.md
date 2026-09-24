@@ -3032,14 +3032,18 @@ void producerConsumer() {
         for (int i = 0; i < 50; ++i) {
             // TODO: std::unique_lock + cv.wait(buffer 未满) + push + cv.notify_one
         }
-        done = true;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            done = true;
+        }
         cv.notify_all();
     };
 
     auto consumer = [&]() {
         while (true) {
-            // TODO: std::unique_lock + cv.wait(buffer 非空 || done) + pop + 处理
+            // TODO: std::unique_lock + cv.wait(buffer 非空 || done)
             if (done && buffer.empty()) break;
+            // TODO: front + pop + notify_one + unlock + 打印
         }
     };
     // TODO: 创建线程并 join
