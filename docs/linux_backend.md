@@ -3643,3 +3643,118 @@ epoll 回声服务器会向客户端回传 `Echo(resp): ...`。
 与练习 3（LT 模式）步骤相同，运行程序时输入 `6`。所有 fd 均设为 `O_NONBLOCK`，ET 模式下循环读写直到 `EAGAIN`。
 
 </details>
+
+---
+
+## 阶段五：Linux 系统编程进阶
+
+> **定位**：综合项目的前置知识之一。补齐阶段四中未覆盖的 Linux 系统级 API，为后续网络服务器、多进程架构、高性能 IO 打基础。
+
+### 5.1 信号处理
+
+- **练习目标**：
+    - 理解信号的本质（异步事件通知）与常见信号（SIGINT / SIGTERM / SIGKILL / SIGCHLD / SIGPIPE / SIGHUP / SIGALRM）。
+    - 掌握 `signal()` 与 `sigaction()` 的区别，能说出为什么生产代码应优先使用 `sigaction`。
+    - 理解信号的阻塞（`sigprocmask`）、挂起（`sigsuspend`）与 `signalfd` 的异步转同步用法。
+    - 掌握 SIGPIPE 的成因（向已关闭的 socket 写数据）与处理方式（忽略或捕获），避免服务器意外崩溃。
+    - 掌握 SIGCHLD 的处理：配合 `waitpid` 回收僵尸子进程。
+- **练习任务**：
+    1. 用 `sigaction` 注册 SIGINT / SIGTERM 处理器，实现服务器的"优雅退出"标志位。
+    2. 忽略 SIGPIPE，验证向已关闭 socket 写数据不再导致进程退出。
+    3. 父进程 fork 多个子进程，用 SIGCHLD + `waitpid(-1, ..., WNOHANG)` 循环回收所有退出子进程，避免僵尸进程。
+    4. 使用 `signalfd` + epoll 把信号处理纳入事件循环（不阻塞主线程）。
+- **巩固标准**：
+    - [ ] 能说出 `signal()` 在不同 Unix 实现中的语义差异，并解释为什么 `sigaction()` 更可移植。
+    > **知识讲解**：`signal()` 的早期 Unix 实现中，信号处理函数可能在执行期间被重置为 `SIG_DFL`（即"一次性"语义），且 `sleep()` 等系统调用被信号中断后不会自动重启。不同系统（Linux、BSD、System V）对这些行为的实现各不相同，导致同一段代码在不同平台上表现不一致。`sigaction()` 通过显式的 `struct sigaction` 结构体精确控制：`sa_flags` 中的 `SA_RESETHAND` 决定是否一次性、`SA_RESTART` 决定是否自动重启被中断的系统调用、`SA_SIGINFO` 决定是否传递详细信号信息——所有行为都由程序员显式指定，不依赖平台默认语义，因此是可移植的首选。
+    - [ ] 能解释 SIGPIPE 在长连接服务器中的触发场景，并给出至少两种处理方式。
+    > **知识讲解**：SIGPIPE 的触发场景：TCP 连接中，客户端异常断开（如 `kill -9`、网线拔掉），服务端不知情仍调用 `send()`/`write()` 向已关闭的 socket 写数据，内核先发送 RST，再次写入时内核产生 SIGPIPE 信号，默认行为是**终止进程**。处理方式：① `signal(SIGPIPE, SIG_IGN)` 忽略信号，`write()` 返回 -1 且 `errno = EPIPE`，程序可优雅处理错误；② `send()` 使用 `MSG_NOSIGNAL` 标志，单次调用不触发 SIGPIPE；③ 用 `sigaction()` 捕获 SIGPIPE 在 handler 中处理。长连接服务器（如聊天服务器、数据库连接池）必须处理 SIGPIPE，否则一个客户端断开就会导致整个服务崩溃。
+    - [ ] 能写出回收多个子进程的正确循环（`while (waitpid(-1, &status, WNOHANG) > 0)`），并解释为什么必须循环。
+    > **知识讲解**：信号可能合并——如果多个子进程几乎同时退出，内核可能只向父进程投递一次 SIGCHLD（标准信号不支持排队）。如果 handler 中只调用一次 `waitpid()`，只能回收一个僵尸进程，其余子进程继续处于僵尸状态。因此必须用 `while` 循环反复调用 `waitpid(-1, &status, WNOHANG)`，直到返回 0（没有更多已退出的子进程）或 -1（出错或无子进程）。`WNOHANG` 保证没有僵尸时立即返回而非阻塞。`-1` 表示等待任意子进程。返回值 > 0 是回收到的子进程 PID，`status` 可通过 `WIFEXITED`/`WEXITSTATUS` 宏解析退出状态。
+    - [ ] 能对比"信号处理函数"与"signalfd + epoll"两种方案的优缺点。
+    > **知识讲解**：**信号处理函数（sigaction）**：优点是实现简单，适合"设标志位退出"的简单场景；缺点是 handler 中只能调用 async-signal-safe 函数（不能用 `std::cout`、`malloc`、`std::vector` 等），多线程环境下信号可能投递到任意线程，处理逻辑受限。**signalfd + epoll**：先用 `sigprocmask()` 阻塞信号（防止内核默认处理），再通过 `signalfd()` 将信号转为文件描述符可读事件，纳入 epoll 事件循环统一处理。优点是信号处理在主循环中执行，没有 async-signal-safe 限制，可以使用所有 C++ 特性；多线程场景下信号只投递到监听的线程，行为可预测。缺点是代码量更多，且需要配合 epoll 事件循环使用。总结：**简单退出场景用 sigaction，事件驱动服务器用 signalfd + epoll**。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 5.1 信号处理 练习框架 ===
+// 项目结构:
+// 5-1-signal/
+// ├── SignalExercises.h
+// ├── SignalExercises.cpp
+// └── main.cpp
+
+// ---------- SignalExercises.h ----------
+#pragma once
+
+// 练习1: 用 sigaction 注册 SIGINT/SIGTERM 处理器，实现优雅退出标志位
+void installGracefulQuitHandler();
+
+// 练习2: 忽略 SIGPIPE，验证向已关闭 socket 写数据不会崩溃
+void ignoreSigpipeAndTest();
+
+// 练习3: 父进程 fork 多个子进程，用 SIGCHLD + waitpid 循环回收避免僵尸
+void reapChildrenWithSigchld();
+
+// 练习4: 用 signalfd + epoll 把信号处理纳入事件循环
+void signalFdWithEpoll();
+
+// ---------- SignalExercises.cpp ----------
+#include "SignalExercises.h"
+
+#include <atomic>
+#include <csignal>
+#include <sys/epoll.h>
+#include <sys/signalfd.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+
+// 练习1
+static std::atomic<bool> g_quit{false};
+static void sigHandler(int /*sig*/, siginfo_t* info, void* /*ucontext*/) {
+    // TODO: 设置 g_quit = true，输出收到的信号
+}
+
+void installGracefulQuitHandler() {
+    // TODO: 用 sigaction 注册 SIGINT / SIGTERM 到 sigHandler
+    // TODO: 主循环 while (!g_quit) { sleep(1); }
+}
+
+// 练习2
+void ignoreSigpipeAndTest() {
+    // TODO: signal(SIGPIPE, SIG_IGN) 或 sigaction 忽略
+    // TODO: 创建 socketpair，关闭一端，向另一端 write，验证进程未退出
+}
+
+// 练习3
+static void sigchldHandler(int /*sig*/, siginfo_t* /*info*/, void* /*ucontext*/) {
+    // TODO: while (waitpid(-1, nullptr, WNOHANG) > 0) 循环回收所有退出子进程
+}
+
+void reapChildrenWithSigchld() {
+    // TODO: sigaction 注册 SIGCHLD 到 sigchldHandler
+    // TODO: fork 3~5 个子进程，子进程 sleep 随机时间后退出
+    // TODO: 父进程 sleep 足够长时间，用 ps 验证无僵尸进程
+}
+
+// 练习4
+void signalFdWithEpoll() {
+    // TODO: sigprocmask 阻塞 SIGINT / SIGTERM
+    // TODO: signalfd(-1, &mask, SFD_NONBLOCK) 创建 signalfd
+    // TODO: 创建 epoll fd，把 signalfd 加入监听 EPOLLIN
+    // TODO: epoll_wait 循环，读到 signalfd 事件时解析 signalfd_siginfo 并退出
+}
+
+// ---------- main.cpp ----------
+#include "SignalExercises.h"
+
+int main() {
+    // TODO: 依次测试以上四个练习
+    return 0;
+}
+```
+
+</details>

@@ -1,3 +1,17 @@
+# 我的 Linux C++ 后端学习路线
+
+> 📌 **配套代码说明**：本文档中的全部练习任务均已完成，完整代码（含框架代码、实现与 CMake 工程）见 GitHub 仓库：
+> 👉 **[https://github.com/HaoqiangLu/cpp_linux_backend_exercises/blob/main/docs/linux_backend.md](https://github.com/HaoqiangLu/cpp_linux_backend_exercises/blob/main/docs/linux_backend.md)**
+> 本版本为“无代码精简版”，仅保留练习目标、练习任务与巩固标准，适合自测与快速回顾；需要对照实现时请前往上述链接查看带代码的完整版。
+
+## 修订记录
+
+| 版本 | 日期 | 修订内容 | 作者 |
+|---|---|---|---|
+| v1.0 | 2026-09-26 | 初版：阶段一至阶段四学习内容（无代码精简版），新增修订记录与配套代码说明 | 阿米亚波 |
+
+---
+
 # 阶段一：STL 容器与算法速成
 
 本阶段核心目标是完成从“C 风格手写数据结构”到“C++ 标准容器 + 算法”的思维转换。重点不在于背诵接口，而在于理解容器的内存模型、复杂度特性以及算法与迭代器的配合。
