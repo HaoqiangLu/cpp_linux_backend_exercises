@@ -3646,11 +3646,11 @@ epoll 回声服务器会向客户端回传 `Echo(resp): ...`。
 
 ---
 
-## 阶段五：Linux 系统编程进阶
+# 阶段五：Linux 系统编程进阶
 
 > **定位**：综合项目的前置知识之一。补齐阶段四中未覆盖的 Linux 系统级 API，为后续网络服务器、多进程架构、高性能 IO 打基础。
 
-### 5.1 信号处理
+## 5.1 信号处理
 
 - **练习目标**：
     - 理解信号的本质（异步事件通知）与常见信号（SIGINT / SIGTERM / SIGKILL / SIGCHLD / SIGPIPE / SIGHUP / SIGALRM）。
@@ -3753,6 +3753,440 @@ void signalFdWithEpoll() {
 
 int main() {
     // TODO: 依次测试以上四个练习
+    return 0;
+}
+```
+
+</details>
+
+## 5.2 内存映射 mmap
+
+- **练习目标**：
+    - 理解虚拟内存、页、缺页中断的基本概念。
+    - 掌握 `mmap` / `munmap` 的用法：匿名映射（进程间共享内存）与文件映射（高效文件 IO）。
+    - 理解 `msync` 的作用：把 mmap 的修改刷回磁盘。
+    - 掌握 POSIX 共享内存（`shm_open` / `ftruncate` / `mmap`）实现无亲缘关系进程间通信。
+- **练习任务**：
+    1. 用 `mmap` 映射一个文件，实现"内存式"读取（对比 `read` 系统调用的性能差异）。
+    2. 用匿名 mmap（`MAP_SHARED | MAP_ANONYMOUS`）在父子进程间共享一块计数器内存。
+    3. 用 POSIX 共享内存实现两个独立进程之间的字符串传递。
+    4. 用 `mmap` 实现一个简单的"共享内存日志"：多进程追加写入，另一进程读取。
+- **巩固标准**：
+    - [ ] 能说出 `mmap` 相比 `read/write` 的优势（减少一次用户态拷贝、利用页缓存）与适用场景。
+      > **知识讲解**：传统 `read()` 系统调用需要两次数据拷贝：① 内核从磁盘读取文件到内核态页缓存（内核缓冲区），② 再从内核缓冲区拷贝到用户态缓冲区（应用程序内存）。`mmap` 将文件直接映射到进程的用户空间虚拟地址，应用程序通过**指针直接访问**映射区域的内存，省去了"内核缓冲区→用户缓冲区"这一次拷贝，零额外内存分配。同时 `mmap` 利用操作系统的**页缓存**机制——文件已在缓存中时直接映射物理页，无需真正读盘；大文件中只访问的部分会被加载（按需调页），未访问部分不占内存。适用场景：大文件随机读取（如搜索引擎索引文件、数据库数据文件）、共享内存通信；不适用场景：小文件（映射本身有系统调用开销，可能反而比 `read` 慢）、需要顺序写一次的文件（`write` 更简单直接）。
+    - [ ] 能解释 `MAP_SHARED` 与 `MAP_PRIVATE`（写时复制）的区别。
+      > **知识讲解**：`MAP_SHARED` 表示映射区域由所有映射该文件的进程**共享**——任一进程对映射内存的写入会**直接写回底层文件**（或通过 `msync` 显式刷盘），其他进程能立即看到修改，适合进程间共享数据和协同写入。`MAP_PRIVATE` 表示**私有映射（写时复制 COW）**——进程读取时看到的是文件原始内容，但一旦写入，内核会为该页创建一份**私有副本**（只复制被写入的那一页，而非整个文件），后续写入只影响副本，**不会修改原文件**，其他进程也看不到。典型用途：只读加载大文件到内存（如加载配置、字典）时用 `MAP_PRIVATE | PROT_READ`，既高效又安全，意外写入也不会破坏原文件；需要多进程共享数据时用 `MAP_SHARED`。
+    - [ ] 能说明共享内存配合互斥锁（`pthread_mutex` 放在共享内存中 + `PTHREAD_PROCESS_SHARED`）的必要性。
+      > **知识讲解**：共享内存（`mmap MAP_SHARED` 或 `shm_open`）只解决了"多进程看到同一块内存"的问题，但**不提供任何同步机制**——多个进程同时读写共享区域时，与多线程一样存在**数据竞争**（读到的可能是写到一半的中间状态）。因此必须配合互斥锁。但普通 `std::mutex` / `pthread_mutex_t` 默认只能在**同一进程的线程间**工作，无法跨进程使用。要让互斥锁跨进程生效，必须：① 把 `pthread_mutex_t` 对象**放在共享内存区域内**（而非进程私有堆栈），② 初始化时调用 `pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED)` 设置跨进程属性，再用该 attr 初始化 mutex。这样多个进程对同一把锁加锁/解锁才能正确互斥。若忘记设置 `PTHREAD_PROCESS_SHARED`，锁只在单进程内有效，跨进程使用时形同虚设，数据竞争依然存在。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 5.2 mmap 练习框架 ===
+// 项目结构:
+// 5-2-mmap/
+// ├── MmapExercises.h
+// ├── MmapExercises.cpp
+// └── main.cpp
+
+// ---------- MmapExercises.h ----------
+#pragma once
+#include <cstddef>
+
+// 练习1: 用 mmap 映射文件，实现内存式读取（对比 read 的性能）
+void mmapReadFile(const char* path);
+
+// 练习2: 用匿名 mmap 在父子进程间共享计数器
+void anonymousMmapCounter();
+
+// 练习3: 用 POSIX 共享内存实现两个独立进程间的字符串传递
+void posixSharedMemory();
+
+// 练习4: 用 mmap 实现简单的共享内存日志（多进程追加写，另一进程读）
+void sharedMemoryLog();
+
+// ---------- MmapExercises.cpp ----------
+#include "MmapExercises.h"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+
+// 练习1
+void mmapReadFile(const char* path) {
+    // TODO: open(path, O_RDONLY)
+    // TODO: fstat 获取文件大小
+    // TODO: mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0)
+    // TODO: 直接遍历内存指针打印内容（对比 read 系统调用）
+    // TODO: munmap + close
+}
+
+// 练习2
+void anonymousMmapCounter() {
+    // TODO: mmap(nullptr, 4096, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0)
+    // TODO: fork 出子进程
+    // TODO: 父子进程各自对计数器 ++N 次，最后打印结果验证共享
+    // TODO: munmap
+}
+
+// 练习3
+void posixSharedMemory() {
+    // TODO: shm_open("/my_shm", O_CREAT|O_RDWR, 0666)
+    // TODO: ftruncate 设置大小
+    // TODO: mmap 映射
+    // TODO: 写入字符串，另一进程读取
+    // TODO: shm_unlink 清理
+}
+
+// 练习4
+struct LogHeader {
+    // TODO: size_t write_pos;  // 当前写入位置
+    // TODO: char data[4096 - sizeof(size_t)];
+};
+
+void sharedMemoryLog() {
+    // TODO: shm_open + ftruncate + mmap 创建共享内存日志
+    // TODO: fork 多个子进程，各自用 __sync_fetch_and_add 原子推进 write_pos 并写入日志
+    // TODO: 父进程 sleep 后读取整块日志打印
+    // TODO: munmap + shm_unlink
+}
+
+// ---------- main.cpp ----------
+#include "MmapExercises.h"
+
+int main() {
+    // TODO: 依次测试以上四个练习
+    return 0;
+}
+```
+
+</details>
+
+## 5.3 进程间通信（IPC）
+
+- **练习目标**：
+    - 系统掌握 Linux IPC 的几种方式：管道（pipe / FIFO）、消息队列、共享内存、信号量、信号、socketpair、Unix Domain Socket。
+    - 能根据场景（数据量、是否跨机、是否需要同步）选择合适的 IPC。
+    - 理解无名管道（pipe）与有名管道（FIFO）的区别。
+    - 掌握 System V IPC 与 POSIX IPC 的对应关系。
+- **练习任务**：
+    1. 用 `pipe()` 实现父子进程间的单向数据传递。
+    2. 用 `FIFO` 实现两个独立进程之间的命令通道。
+    3. 用 `socketpair()` 实现全双工的父子进程通信（对比 pipe 的半双工）。
+    4. 用 POSIX 共享内存 + 互斥锁实现一个简单的"生产者-消费者"模型。
+    5. 对比五种 IPC 方式的性能（吞吐量、延迟）与适用场景，写一份小结。
+- **巩固标准**：
+    - [ ] 能画出"pipe / FIFO / socketpair / 共享内存 / 消息队列"的数据流图。
+      > **知识讲解**：五种 IPC 方式的数据流路径各不相同。**pipe（无名管道）**：父进程 `pipe()` 创建一对 fd（read/write），`fork` 后子进程继承 fd，关闭不需要的端，形成单向数据流（父→子或子→父），生命周期随进程结束。**FIFO（有名管道）**：`mkfifo` 在文件系统创建一个特殊文件节点，两个**无亲缘关系**的进程通过 `open` 同一 FIFO 路径建立通道，数据仍经内核缓冲区传递，写端关闭后读端收到 EOF。**socketpair**：`socketpair(AF_UNIX, SOCK_STREAM)` 创建一对互联的 socket fd，`fork` 后父子各持一端，支持**全双工**双向读写（对比 pipe 的半双工），数据在内核缓冲区中流转，不经过网络栈。**共享内存（mmap/shm_open）**：多个进程把同一块物理内存映射到各自虚拟地址空间，数据**零拷贝**直接在内存中读写，最快但无同步——需配合信号量或互斥锁。**消息队列（System V `msgget`/POSIX `mq_open`）**：数据以"消息"为单位存放在内核队列中，进程通过 `msgsnd`/`msgrcv` 收发，自带消息边界，但每次读写需内核拷贝（用户态↔内核态），吞吐量低于共享内存。
+    - [ ] 能解释为什么"共享内存 + 同步原语"是本地最快 IPC，而 Unix Domain Socket 是本地最通用的 IPC。
+      > **知识讲解**：**共享内存最快**的原因：数据写入后其他进程**直接通过指针读取**，全程零拷贝——不需要像 pipe/FIFO/消息队列那样把数据从写进程的用户态拷贝到内核缓冲区、再从内核缓冲区拷贝到读进程的用户态（两次拷贝）。唯一开销是同步原语（mutex/semaphore）的加解锁。但共享内存"只管存不管序"，必须外部同步，且只适用于同一台机器上的进程。**Unix Domain Socket 最通用**的原因：它使用 `AF_UNIX` 地址族，数据在内核中传递（不经过网络栈），性能接近 pipe；但同时支持 `SOCK_STREAM`（流式、类 TCP 语义）和 `SOCK_DGRAM`（数据报、类 UDP 语义，保留消息边界），接口与 TCP socket 完全一致（`send`/`recv`/`bind`/`listen`/`accept`），可以无缝替换网络 socket——同一套代码改个地址就能从本地通信切换到跨机通信，是本地最通用的 IPC。
+    - [ ] 能说出 pipe 的容量限制（`PIPE_BUF`）以及超过容量时的阻塞行为。
+      > **知识讲解**：Linux 中 pipe 的内核缓冲区大小有限——`PIPE_BUF`（通常 4096 字节）是保证原子写入的最大长度：写入 ≤ `PIPE_BUF` 字节时，内核保证该次写入是原子的（不会被其他进程的写入交错插入）；写入 > `PIPE_BUF` 时，内核可能拆分为多次写入，与其他进程的写入可能交错。pipe 的总缓冲区大小（`/proc/sys/fs/pipe-max-size`，默认 64KB）是管道能缓存的最大数据量。当管道已满时，`write()` 会**阻塞**直到读端取走数据腾出空间；当管道为空时，`read()` 会**阻塞**直到有数据写入。写端全部关闭后，读端 `read()` 返回 0（EOF）；读端全部关闭后，写端 `write()` 触发 **SIGPIPE** 信号（默认终止进程）。利用这些阻塞特性可以实现简单的进程间同步——生产者写满时自动等待消费者消费。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 5.3 IPC 练习框架 ===
+// 项目结构:
+// 5-3-ipc/
+// ├── IpcExercises.h
+// ├── IpcExercises.cpp
+// └── main.cpp
+
+// ---------- IpcExercises.h ----------
+#pragma once
+
+// 练习1: 用 pipe 实现父子进程间的单向数据传递
+void pipeParentChild();
+
+// 练习2: 用 FIFO 实现两个独立进程间的命令通道
+void fifoChannel();
+
+// 练习3: 用 socketpair 实现全双工的父子进程通信
+void socketpairDuplex();
+
+// 练习4: 用 POSIX 共享内存 + 互斥锁实现生产者-消费者
+void producerConsumer();
+
+// 练习5: 对比五种 IPC 方式的性能与适用场景，写一份小结
+void ipcBenchmark();
+
+// ---------- IpcExercises.cpp ----------
+#include "IpcExercises.h"
+
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+
+// 练习1
+void pipeParentChild() {
+    int pipefd[2];
+    // TODO: pipe(pipefd)
+    // TODO: fork
+    // TODO: 子进程关闭读端，向写端发送数据
+    // TODO: 父进程关闭写端，从读端读取并打印
+}
+
+// 练习2
+void fifoChannel() {
+    const char* path = "/tmp/my_fifo";
+    // TODO: mkfifo(path, 0666)
+    // TODO: 启动两个终端，一个 open(O_WRONLY) 写命令，另一个 open(O_RDONLY) 读命令
+    // TODO: unlink 清理
+}
+
+// 练习3
+void socketpairDuplex() {
+    int sv[2];
+    // TODO: socketpair(AF_UNIX, SOCK_STREAM, 0, sv)
+    // TODO: fork
+    // TODO: 父子进程各自关闭一端，双向读写
+}
+
+// 练习4
+struct SharedData {
+    pthread_mutex_t mtx;
+    int buffer[8];
+    int head, tail, count;
+};
+
+void producerConsumer() {
+    // TODO: shm_open + ftruncate + mmap 创建共享内存
+    // TODO: pthread_mutexattr_setpshared(PTHREAD_PROCESS_SHARED) 初始化互斥锁
+    // TODO: fork 出生产者与消费者进程
+    // TODO: 生产者加锁 → 写 buffer → 解锁
+    // TODO: 消费者加锁 → 读 buffer → 解锁
+}
+
+// 练习5
+void ipcBenchmark() {
+    // TODO: 分别对 pipe / FIFO / socketpair / 共享内存 / 消息队列 发送 1MB 数据
+    // TODO: 记录耗时，输出对比表格
+    // TODO: 写一份小结：各自适用场景
+}
+
+// ---------- main.cpp ----------
+#include "IpcExercises.h"
+
+int main() {
+    // TODO: 依次测试以上五个练习
+    return 0;
+}
+```
+
+</details>
+
+## 5.4 守护进程与进程管理
+
+- **练习目标**：
+    - 理解守护进程的特征（无控制终端、后台运行、长生命周期）。
+    - 掌握守护进程的编写步骤：fork + setsid + fork + 关闭/重定向 FD + 修改工作目录。
+    - 理解 PID 文件的作用：防止重复启动、便于停止脚本。
+    - 掌握进程池的基本模型（master + workers）。
+- **练习任务**：
+    1. 实现一个守护进程化的"心跳程序"：每秒写一次时间戳到日志文件。
+    2. 实现 PID 文件锁（`flock`），保证同一时刻只能运行一个实例。
+    3. 实现一个 master + N workers 的进程池模型：master 接收任务（从 pipe），分发给空闲 worker。
+    4. 用 `prctl(PR_SET_PDEATHSIG, ...)` 让子进程在父进程退出时自动退出，避免孤儿进程。
+- **巩固标准**：
+    - [ ] 能手写"双 fork + setsid"的守护进程模板，并解释每一步的作用。
+      > **知识讲解**：守护进程的标准创建步骤——第一次 `fork()` 产生子进程，父进程退出，子进程被 init 收养（确保后续 `setsid` 能成功，因为 `setsid` 要求调用者不是会话领袖）；`setsid()` 使子进程创建新会话、脱离原会话和控制终端；第二次 `fork()` 再产生孙进程并让子进程退出，孙进程不再是会话领袖，按 POSIX 规则只有会话领袖才能重新获得控制终端，从而**彻底防止守护进程重新关联终端**。之后关闭或重定向 stdin/stdout/stderr 到 `/dev/null`（避免占用终端或挂载点），`chdir("/")` 修改工作目录（防止守护进程的工作目录在某个挂载点上导致该文件系统无法卸载）。有些实现还会加上 `umask(0)` 清除文件权限掩码，使后续创建文件的权限完全由程序自己控制。
+    - [ ] 能说出为什么守护进程要关闭或重定向 stdin/stdout/stderr（避免占用挂载点、避免写入终端）。
+      > **知识讲解**：守护进程在后台运行，没有控制终端。若保留 stdin 打开指向原终端，终端关闭时会向守护进程发送 `SIGHUP` 信号导致意外终止；若 stdout/stderr 仍指向终端，一方面输出会显示在终端上干扰用户，另一方面终端关闭后守护进程继续 `printf`/`std::cout` 写入已断开的终端会触发 `SIGPIPE` 或写入被丢弃导致不可预期行为。正确做法是 `close(0); close(1); close(2);` 后 `open("/dev/null", ...)` 将 fd 0/1/2 重定向到 `/dev/null`。注意必须**重定向到 `/dev/null` 而非简单关闭**——因为某些库函数可能默认使用 fd 0/1/2，关闭后新打开的文件可能恰好获得这些 fd 编号，导致库函数意外写入错误目标。
+    - [ ] 能对比"进程池"与"线程池"的适用场景（CPU 密集 vs IO 密集、隔离性、上下文切换成本）。
+      > **知识讲解**：**进程池**适合 CPU 密集型任务——每个进程有独立地址空间，能充分利用多核并行（无 GIL 限制），且故障隔离好（一个 worker 崩溃不影响 master 和其他 worker）；缺点是进程间通信需借助管道/共享内存/消息队列等 IPC，数据交换成本较高，进程创建和上下文切换开销大（需切换页表、刷新 TLB）。**线程池**适合 IO 密集型任务——线程共享地址空间，通信方便（直接读写共享内存），线程切换成本远低于进程切换（共享页表，只需切换寄存器和栈），IO 等待时线程让出 CPU 不会增加 CPU 竞争；缺点是需要同步保护共享数据（mutex/condition_variable），一个线程崩溃可能导致整个进程段错误。选择原则：**需要隔离性和 CPU 并行用进程池，需要高并发 IO 和便捷通信用线程池**。也可以混合使用——主从 Reactor 模型中 master 用多进程 accept，worker 用多线程处理 IO。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 5.4 守护进程与进程管理 练习框架 ===
+// 项目结构:
+// 5-4-daemon/
+// ├── DaemonExercises.h
+// ├── DaemonExercises.cpp
+// └── main.cpp
+
+// ---------- DaemonExercises.h ----------
+#pragma once
+
+// 练习1: 实现守护进程化的心跳程序（每秒写时间戳到日志文件）
+void daemonHeartbeat();
+
+// 练习2: 实现 PID 文件锁，保证同一时刻只能运行一个实例
+bool acquirePidLock(const char* pidFile);
+void releasePidLock(const char* pidFile);
+
+// 练习3: 实现 master + N workers 的进程池模型
+void processPool();
+
+// 练习4: 用 prctl(PR_SET_PDEATHSIG) 让子进程在父进程退出时自动退出
+void preventOrphan();
+
+// ---------- DaemonExercises.cpp ----------
+#include "DaemonExercises.h"
+
+#include <fcntl.h>
+#include <sys/prctl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+
+// 练习1
+void daemonHeartbeat() {
+    // TODO: fork
+    // TODO: setsid 创建新会话
+    // TODO: 再次 fork 防止重新获得控制终端
+    // TODO: 关闭 stdin/stdout/stderr，重定向到 /dev/null
+    // TODO: chdir("/") 修改工作目录
+    // TODO: 循环 sleep(1)，写时间戳到 /tmp/heartbeat.log
+}
+
+// 练习2
+bool acquirePidLock(const char* pidFile) {
+    // TODO: open(pidFile, O_CREAT|O_RDWR, 0644)
+    // TODO: flock(fd, LOCK_EX|LOCK_NB) 尝试加锁，失败说明已有实例在跑
+    // TODO: ftruncate + write(getpid())
+    // TODO: 返回 true 表示加锁成功
+    return false;
+}
+
+void releasePidLock(const char* pidFile) {
+    // TODO: flock(fd, LOCK_UN) + close(fd) + unlink(pidFile)
+}
+
+// 练习3
+void processPool() {
+    const int N = 4;
+    int taskPipe[2];
+    // TODO: pipe(taskPipe) 创建任务管道
+    // TODO: fork N 个 worker，每个 worker 循环从读端读任务并执行
+    // TODO: master 从写端写入任务，实现分发
+    // TODO: master 关闭写端，waitpid 等待所有 worker 退出
+}
+
+// 练习4
+void preventOrphan() {
+    // TODO: fork 出子进程
+    // TODO: 子进程中 prctl(PR_SET_PDEATHSIG, SIGTERM)
+    // TODO: 子进程循环 sleep，父进程主动退出
+    // TODO: 验证子进程在父进程退出后也自动退出（ps 查看）
+}
+
+// ---------- main.cpp ----------
+#include "DaemonExercises.h"
+
+int main() {
+    // TODO: 依次测试以上四个练习
+    return 0;
+}
+```
+
+</details>
+
+---
+
+## 阶段六：网络编程进阶
+
+> **定位**：综合项目的核心前置知识。从阶段四的"能写 socket / epoll"升级到"能写一个健壮的长连接服务器"。
+
+### 6.1 TCP 协议细节
+
+- **练习目标**：
+    - 深入理解三次握手 / 四次挥手的过程与每个状态（LISTEN / SYN_SENT / SYN_RECV / ESTABLISHED / FIN_WAIT_1 / FIN_WAIT_2 / CLOSE_WAIT / LAST_ACK / TIME_WAIT）。
+    - 能用 `netstat` / `ss` 观察连接状态，定位 TIME_WAIT 堆积、CLOSE_WAIT 泄漏等问题。
+    - 理解 TCP 的可靠传输机制：序号、确认、重传、滑动窗口、拥塞控制（概念层面）。
+- **练习任务**：
+    1. 用 `tcpdump` 抓包观察一次完整的 TCP 三次握手与四次挥手，标注每个包的状态变化。
+    2. 写一个客户端"中途 kill"的场景，观察服务端的 CLOSE_WAIT 堆积，分析原因并修复。
+    3. 写一个短连接压测脚本，观察 TIME_WAIT 堆积，通过 `sysctl` 调整 `net.ipv4.tcp_tw_reuse` 缓解。
+    4. 用 `ss -s` 查看系统级 TCP 统计，解读各状态数量。
+- **巩固标准**：
+    - [ ] 能画出 TCP 状态机，并解释每个状态转换的触发条件。
+    - [ ] 能解释 TIME_WAIT 为什么由"主动关闭方"进入，持续 2MSL 的原因。
+    - [ ] 能定位 CLOSE_WAIT 泄漏的根因（未调用 close / 上层逻辑未处理对端 FIN）。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 6.1 TCP 协议细节 练习框架 ===
+// 项目结构:
+// 6-1-tcp/
+// ├── TcpExercises.h
+// ├── TcpExercises.cpp
+// └── main.cpp
+
+// ---------- TcpExercises.h ----------
+#pragma once
+
+// 练习2: 写一个客户端中途 kill 的场景，观察服务端的 CLOSE_WAIT 堆积
+void startEchoServer();       // 服务端，用于练习 2/3
+void startBrokenClient();     // 客户端，故意不发 FIN
+
+// 练习3: 短连接压测脚本，观察 TIME_WAIT 堆积
+void shortConnectionStress(int count);
+
+// 练习4: 用 ss -s 查看系统级 TCP 统计
+void printTcpStats();
+
+// ---------- TcpExercises.cpp ----------
+#include "TcpExercises.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstdlib>
+
+void startEchoServer() {
+    // TODO: socket + bind + listen
+    // TODO: accept 循环，read 后 write 回去
+    // TODO: 注意：客户端断开时不要主动 close，观察 CLOSE_WAIT
+}
+
+void startBrokenClient() {
+    // TODO: connect 到 127.0.0.1:port
+    // TODO: send 一些数据后直接 _exit(0)（不发 FIN）
+    // TODO: 用 ss -tan 观察服务端连接状态
+}
+
+void shortConnectionStress(int count) {
+    // TODO: 循环 count 次，每次 connect + send + recv + close
+    // TODO: 用 ss -tan state time-wait 观察 TIME_WAIT 堆积
+    // TODO: 提示用户用 sysctl 调整 net.ipv4.tcp_tw_reuse
+}
+
+void printTcpStats() {
+    // TODO: system("ss -s") 或 popen 读取输出
+}
+
+// ---------- main.cpp ----------
+#include "TcpExercises.h"
+
+int main() {
+    // TODO: 依次测试以上练习
     return 0;
 }
 ```
