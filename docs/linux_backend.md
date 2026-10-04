@@ -5120,7 +5120,8 @@ int main() {
 
 </details>
 
-#### 测试步骤
+<details>
+<summary>🧪 测试步骤</summary>
 
 需要 **2 个终端**：
 
@@ -5142,5 +5143,7 @@ int main() {
 - **主从 Reactor 分工**：main-reactor 只负责 accept 新连接（不处理读写），连接建立后读写事件由所属 sub-reactor 处理——这是 Netty 主从 Reactor 模型的经典实现。
 - **ET 模式行为**：服务器使用 `EPOLLET` 边缘触发，`handleRead` 必须循环读到 `EAGAIN` 为止，否则会漏事件；这也是本练习的核心练习点。
 - **优雅关闭**：服务器 `Ctrl+C` 退出时，析构函数会 `quit()` 所有 sub-reactor 并 `join` 工作线程，无僵尸线程或内存泄漏。
+
+</details>
 
 ---
