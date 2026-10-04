@@ -4105,11 +4105,11 @@ int main() {
 
 ---
 
-## 阶段六：网络编程进阶
+# 阶段六：网络编程进阶
 
 > **定位**：综合项目的核心前置知识。从阶段四的"能写 socket / epoll"升级到"能写一个健壮的长连接服务器"。
 
-### 6.1 TCP 协议细节
+## 6.1 TCP 协议细节
 
 - **练习目标**：
     - 深入理解三次握手 / 四次挥手的过程与每个状态（LISTEN / SYN_SENT / SYN_RECV / ESTABLISHED / FIN_WAIT_1 / FIN_WAIT_2 / CLOSE_WAIT / LAST_ACK / TIME_WAIT）。
@@ -4122,8 +4122,21 @@ int main() {
     4. 用 `ss -s` 查看系统级 TCP 统计，解读各状态数量。
 - **巩固标准**：
     - [ ] 能画出 TCP 状态机，并解释每个状态转换的触发条件。
+    > **知识讲解**：TCP 状态机分为连接建立、数据传输、连接关闭三个阶段。建立阶段：`CLOSED` → 主动方 `send(SYN)` → `SYN_SENT` → 被动方收到后 `recv(SYN)+send(SYN+ACK)` → `SYN_RECV` → 主动方 `recv(ACK)` → 双方进入 `ESTABLISHED`。关闭阶段（四次挥手）：主动方 `send(FIN)` → `FIN_WAIT_1` → 被动方 `recv(FIN)+send(ACK)` → 主动方进入 `FIN_WAIT_2`、被动方进入 `CLOSE_WAIT` → 被动方 `send(FIN)` → 主动方 `recv(FIN)+send(ACK)` → 主动方进入 `TIME_WAIT`、被动方进入 `LAST_ACK` → 主动方 `recv(ACK)` → 被动方进入 `CLOSED`；主动方在 `TIME_WAIT` 等待 2MSL 后也进入 `CLOSED`。常见面试陷阱：`CLOSE_WAIT` 是被动关闭方的状态，如果长期停留说明应用层没有调用 `close()`，属于程序 bug。
+    >
+    > **注意**：上述 `send(SYN)`、`recv(FIN)` 等是 **TCP 协议层的行为描述**（内核自动完成的报文收发），不是代码中需要调用的函数。下表列出协议动作与实际 socket API 的对应关系：
+    >
+    > | 协议层动作 | 代码中触发的 API | 说明 |
+    > |---|---|---|
+    > | `send(SYN)` | `connect()` | 客户端调用 `connect()`，内核自动发出 SYN |
+    > | `recv(SYN)` + `send(SYN+ACK)` | `listen()` + `accept()` | 服务端 `accept()` 时内核完成 SYN 接收与 SYN+ACK 回复 |
+    > | `send(FIN)` | `close(fd)` 或 `shutdown(fd, SHUT_WR)` | 应用层关闭写端，内核自动发 FIN |
+    > | `recv(FIN)` | `read()` / `recv()` 返回 0 | 对端发出 FIN 后，本端 `read()` 返回 0 表示对端已关闭 |
+    > | `send(ACK)` | 无需手动调用 | ACK 由内核 TCP 栈自动发送，应用层不感知 |
     - [ ] 能解释 TIME_WAIT 为什么由"主动关闭方"进入，持续 2MSL 的原因。
+    > **知识讲解**：`TIME_WAIT` 由主动关闭方（最后发送 ACK 的一方）进入，有两个核心原因：① **保证最后一个 ACK 能到达对端**——如果该 ACK 丢失，被动关闭方会重发 FIN，主动关闭方必须在 `TIME_WAIT` 状态下才能重新发送 ACK，否则对端永远无法关闭。② **让网络中该连接的残余报文消散**——MSL（Maximum Segment Lifetime）是报文在网络中的最大生存时间（Linux 默认 60 秒），等待 2MSL 可以确保：本方发出的最后一个 ACK 的 MSL 内到达 + 对端重发 FIN 的 MSL 内到达，从而旧连接的所有报文都已从网络中消失，不会干扰新连接。2MSL 期间该连接的四元组（源 IP、源端口、目的 IP、目的端口）不能被复用，这就是短连接高频场景下 `TIME_WAIT` 堆积导致端口耗尽的原因。
     - [ ] 能定位 CLOSE_WAIT 泄漏的根因（未调用 close / 上层逻辑未处理对端 FIN）。
+    > **知识讲解**：`CLOSE_WAIT` 是被动关闭方的状态，表示本端已收到对端的 FIN（即对端关闭了写端），但本端应用层还没有调用 `close()`。正常情况下，应用层收到 `read()` 返回 0（表示对端已关闭）后应立即 `close()`，连接会快速经过 `LAST_ACK` → `CLOSED`。如果大量连接停留在 `CLOSE_WAIT`，说明应用层存在 bug：① 没有检查 `read()` 返回值是否为 0，导致没有触发 `close()`；② 业务逻辑中遗漏了异常分支的 `close()` 调用；③ 使用了 epoll 但没有监听 `EPOLLHUP` 或 `EPOLLRDHUP` 事件。排查方法：`ss -tan state close-wait` 查看堆积数量，结合日志确认对应连接的业务处理流程是否走到了 `close()` 分支。与 `TIME_WAIT` 不同，`CLOSE_WAIT` 泄漏是纯粹的代码问题，无法通过内核参数缓解。
 
 <details>
 <summary>📦 练习框架代码</summary>
@@ -4140,10 +4153,11 @@ int main() {
 #pragma once
 
 // 练习2: 写一个客户端中途 kill 的场景，观察服务端的 CLOSE_WAIT 堆积
-void startEchoServer();       // 服务端，用于练习 2/3
+void startEchoServer();       // 服务端（故意不 close），用于练习 2
 void startBrokenClient();     // 客户端，故意不发 FIN
 
 // 练习3: 短连接压测脚本，观察 TIME_WAIT 堆积
+void startStressEchoServer(); // 练习3 专用：echo 后立即 close 的循环服务端
 void shortConnectionStress(int count);
 
 // 练习4: 用 ss -s 查看系统级 TCP 统计
@@ -4178,6 +4192,12 @@ void shortConnectionStress(int count) {
     // TODO: 提示用户用 sysctl 调整 net.ipv4.tcp_tw_reuse
 }
 
+void startStressEchoServer() {
+    // TODO: socket + setsockopt(SO_REUSEADDR) + bind(8080) + listen
+    // TODO: accept 循环，recv → write 回显 → 立即 close(client_fd)
+    // 与 startEchoServer 区别：这里必须 close，才能让客户端进入 TIME_WAIT
+}
+
 void printTcpStats() {
     // TODO: system("ss -s") 或 popen 读取输出
 }
@@ -4192,3 +4212,935 @@ int main() {
 ```
 
 </details>
+
+<details>
+<summary>🧪 测试操作步骤</summary>
+
+> 端口固定为 **8080**，本节练习需要**多个终端窗口**配合：一个跑服务端、一个跑客户端、一个用 `ss` 观察状态。所有练习共用同一套编译流程，仅菜单选项不同——程序通过 `main.cpp` 的菜单分发：`1`=startEchoServer，`2`=startBrokenClient，`3`=shortConnectionStress，`4`=printTcpStats。
+
+#### 练习 2：观察 CLOSE_WAIT 堆积
+
+需要 **3 个终端**：
+
+| 步骤 | 终端 A（服务端） | 终端 B（坏客户端） | 终端 C（观察） |
+|------|------------------|--------------------|----------------|
+| 1 | 运行程序，输入 `1` 启动 startEchoServer，阻塞在 accept | | |
+| 2 | | 运行程序，输入 `2` 启动 startBrokenClient | |
+| 3 | 打印 `read returned 6, no close(cfd=...)`，之后**故意不 close** | 发送 `Hello!` 后 `_exit(0)` 直接退出 | |
+| 4 | 保持运行 | | 执行 `ss -tan state close-wait` |
+| 5 | | | 看到一条 8080 连接长期停在 **CLOSE_WAIT** |
+| 6 | `Ctrl+C` 停止服务端 | | |
+
+**验证要点**：服务端收到客户端 FIN 后进入 CLOSE_WAIT，但因为**从不调用 `close(client_fd)`**，连接会一直滞留。多次运行客户端可看到 CLOSE_WAIT 连接数持续增加（同时服务端 fd 泄漏）——这正是生产中「CLOSE_WAIT 堆积 = 应用层忘记关闭 fd」的根因，对应巩固标准第 3 条。
+
+### 练习 3：观察 TIME_WAIT 堆积
+
+> ⚠️ **前置条件**：TIME_WAIT 出现在**主动关闭方**，且必须**收到对端 FIN** 后才能进入。上面的 startEchoServer **故意不 close**，若直接拿它做压测服务端，客户端只会停在 **FIN_WAIT_2**、服务端停在 **CLOSE_WAIT**，**观察不到 TIME_WAIT**。因此练习 3 必须换一个「收数据 → 回显 → 正常 close」的服务端：本项目已内置 `startStressEchoServer`（菜单选项 `5`，accept 循环 + 回显 + 立即 close，并带 `SO_REUSEADDR` 方便反复重启），直接用它即可。
+
+需要 **2 个终端**：
+
+| 步骤 | 终端 A（正常关闭的回声服务端） | 终端 B（压测客户端） |
+|------|--------------------------------|----------------------|
+| 1 | 运行程序，输入 `5` 启动 startStressEchoServer（echo 后立即 close，阻塞在 accept 循环） | |
+| 2 | | 运行程序，输入 `3`，再输入压测次数（如 `2000`） |
+| 3 | 循环 accept → 回显 → close | 循环 connect → send → recv → **close**（客户端主动关闭） |
+| 4 | | 结束后执行 `ss -tan state time-wait \| wc -l` |
+| 5 | | 看到大量 **TIME_WAIT**（客户端侧，持续 2MSL≈60s） |
+
+**验证要点**：每条短连接都由客户端主动 close，走完四次挥手后客户端进入 TIME_WAIT，`count` 越大堆积越多。缓解手段：`sudo sysctl -w net.ipv4.tcp_tw_reuse=1`（允许复用 TIME_WAIT 端口，主要对客户端有效）。
+
+### 练习 4：查看系统级 TCP 统计
+
+需要 **1 个终端**：
+
+| 步骤 | 操作 |
+|------|------|
+| 1 | 运行程序，输入 `4` 调用 printTcpStats |
+| 2 | 内部执行 `ss -s`，打印整机 TCP 汇总 |
+| 3 | 关注 `estab` / `timewait` / `closed`（含 CLOSE_WAIT）各状态数量 |
+
+**验证要点**：在练习 2、练习 3 的前后分别运行一次，对比 `timewait`、`closed` 数量变化，即可量化前面制造的现象。若想在程序里自动做前后差值，可把 `system("ss -s")` 换成 `popen` 读取输出再解析。
+
+</details>
+
+## 6.2 粘包与半包处理
+
+- **练习目标**：
+    - 理解 TCP 是字节流协议，没有"消息边界"，应用层必须自己拆包。
+    - 掌握三种主流拆包方案：定长包、分隔符包、Length-Field（长度字段）包。
+    - 能结合 epoll 缓冲区实现一个健壮的"读半包 → 拼包 → 拆包"流程。
+- **练习任务**：
+    1. 实现"定长包"协议：每条消息固定 64 字节，不足补齐。
+    2. 实现"分隔符包"协议：以 `\n` 为分隔（类似文本协议），处理粘包与半包。
+    3. 实现"Length-Field"协议：前 4 字节为消息长度（大端），后接消息体。
+    4. 写一个压测客户端：故意分片发送（每次只发 1 字节 / 一次发多条），验证服务端的拆包逻辑。
+- **巩固标准**：
+    - [ ] 能画出"接收缓冲区 → 拆包循环 → 应用层回调"的流程图。
+    > **知识讲解**：整条流水线分三步：**① 追加缓冲区**——`epoll` 通知可读后，调用 `read()`/`recv()` 把收到的字节**追加**到该连接专属的接收缓冲区尾部（如 `std::string` / `std::vector<char>`），注意是追加而非覆盖，因为一次 `read` 返回的可能是半包或多包。**② 拆包循环**——`while` 循环检查缓冲区：剩余字节数是否 ≥ 帧头长度？够则解析帧头得到期望包长，再检查剩余字节数是否 ≥ 帧头 + 包长；不够则 `break` 退出循环，保留缓冲区数据等待下一次可读事件（这就是"半包"的自然去向）；够则从缓冲区头部截取一条完整消息并 `erase` 已消费的部分——一次 `read` 收了多条消息（"粘包"）就在这一轮循环里被连续拆出多条。**③ 应用层回调**——每拆出一条完整消息，立即通过回调（如 `MessageCallback`）交给业务处理，业务代码只见完整消息、不见字节流。核心思想：**缓冲区负责攒字节，循环负责剥完整包，剩下的永远是不完整的尾巴**。常见错误：忘记从缓冲区头部删除已消费的字节，导致同一条消息被反复拆出。
+    - [ ] 能解释为什么 Length-Field 是二进制协议最常用的方案（效率 + 通用性）。
+    > **知识讲解**：**效率层面**——定长包在消息长度参差时浪费严重（短消息补零占带宽、长消息还得拆片）；分隔符包必须逐字节扫描整个消息体才能找到边界，且扫描结果决定包长，无法预分配缓冲区；Length-Field 只需读固定 4 字节帧头就已知整包大小：半包时直接对比"已收字节数 vs 声明长度"，定位边界是 O(1) 而非 O(n)，还能按声明长度一次性预留缓冲区。**通用性层面**——消息体可以是任意二进制数据（含 `\0`、含分隔符字节都无所谓，因为根本不扫描内容），且帧头天然可扩展为携带版本号、消息类型、校验和等字段（TLV 思想），protobuf、gRPC、HTTP/2 帧、MySQL 协议底层全是"长度前缀"结构。工程注意事项：帧头字节序要统一（网络字节序大端，配 `htonl`/`ntohl` 转换）；解析长度字段后必须**上限校验**（如限制单包 ≤ 1 MB），否则恶意构造的超大长度字段会让服务端分配巨量内存直接 OOM。
+    - [ ] 能处理"消息体中又出现分隔符"的转义问题。
+    > **知识讲解**：以 `\n` 分隔的文本协议有个固有缺陷：如果消息体本身包含 `\n`（如用户输入的日志行、多行文本），朴素的 `find('\n')` 会把一条消息从中间错误切断。解决思路有三：**① 转义（escaping）**——约定一个转义字符（如 `\`），发送端编码时把消息体中出现的 `\n` 替换为两个字面字符 `\` + `n`、`\` 自身替换为 `\\`，接收端解码时逆向还原；Redis RESP、JSON 字符串、CSV 引号包裹都是这一思路。关键在于**编解码必须严格互逆**，且转义要先替换转义符本身再替换分隔符，否则会产生二义性。**② 改用 Length-Field**——不扫描分隔符、按长度切边界，消息体内容是什么都无关紧要，这正是二进制协议偏爱长度前缀的根本原因。**③ 校验 + 重新同步**——拆出的"包"若校验失败（长度字段异常、checksum 不匹配）说明帧已错位，丢弃缓冲区内数据等待连接重置或扫描下一个合法帧头。面试高频陷阱："为什么分隔符协议不适合传图片/文件等二进制数据"——因为二进制内容中任何字节都可能出现，分隔符方案要么转义开销巨大，要么根本无法保证边界可靠。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 6.2 粘包与半包 练习框架 ===
+// 项目结构:
+// 6-2-packet/
+// ├── PacketCodec.h
+// ├── PacketCodec.cpp
+// └── main.cpp
+
+// ---------- PacketCodec.h ----------
+#pragma once
+#include <cstdint>
+#include <functional>
+#include <string>
+
+// 拆包回调：每拆出一条完整消息就回调一次
+using MessageCallback = std::function<void(const std::string& msg)>;
+
+// 练习1: 定长包协议（每条消息固定 64 字节）
+class FixedLengthCodec {
+public:
+    explicit FixedLengthCodec(size_t fixedLen = 64);
+    // 输入接收缓冲区新数据，内部拆包并回调
+    void onData(const char* data, size_t len, const MessageCallback& cb);
+private:
+    size_t fixedLen_;
+    std::string buffer_;
+};
+
+// 练习2: 分隔符包协议（以 '\n' 为分隔）
+class DelimiterCodec {
+public:
+    explicit DelimiterCodec(char delim = '\n');
+    void onData(const char* data, size_t len, const MessageCallback& cb);
+private:
+    char delim_;
+    std::string buffer_;
+};
+
+// 练习3: Length-Field 协议（前 4 字节大端长度 + 消息体）
+class LengthFieldCodec {
+public:
+    void onData(const char* data, size_t len, const MessageCallback& cb);
+private:
+    std::string buffer_;
+};
+
+// ---------- PacketCodec.cpp ----------
+#include "PacketCodec.h"
+#include <arpa/inet.h>
+
+// 练习1
+FixedLengthCodec::FixedLengthCodec(size_t fixedLen) : fixedLen_(fixedLen) {}
+
+void FixedLengthCodec::onData(const char* data, size_t len, const MessageCallback& cb) {
+    // TODO: buffer_.append(data, len)
+    // TODO: while (buffer_.size() >= fixedLen_) { 取出前 fixedLen_ 字节回调; buffer_.erase(0, fixedLen_); }
+}
+
+// 练习2
+DelimiterCodec::DelimiterCodec(char delim) : delim_(delim) {}
+
+void DelimiterCodec::onData(const char* data, size_t len, const MessageCallback& cb) {
+    // TODO: buffer_.append(data, len)
+    // TODO: while (auto pos = buffer_.find(delim_)) != npos { 回调 substr(0,pos); buffer_.erase(0,pos+1); }
+}
+
+// 练习3
+void LengthFieldCodec::onData(const char* data, size_t len, const MessageCallback& cb) {
+    // TODO: buffer_.append(data, len)
+    // TODO: while (buffer_.size() >= 4) {
+    //   读取前 4 字节为 bodyLen（大端转主机序）
+    //   if (buffer_.size() < 4 + bodyLen) break;  // 半包
+    //   取出 body 回调
+    //   buffer_.erase(0, 4 + bodyLen);
+    // }
+}
+
+// ---------- main.cpp ----------
+#include "PacketCodec.h"
+#include <iostream>
+
+int main() {
+    // 练习4: 压测客户端，故意分片发送验证拆包逻辑
+    auto cb = [](const std::string& m) {
+        std::cout << "[msg] " << m << "\n";
+    };
+
+    FixedLengthCodec fc(8);
+    const char* d1 = "helloXXXworldXXX";  // 两条定长消息
+    fc.onData(d1, 16, cb);
+
+    DelimiterCodec dc;
+    dc.onData("hello\nwor", 8, cb);  // 半包
+    dc.onData("ld\nfoo\n", 8, cb);   // 粘包 + 补齐
+
+    LengthFieldCodec lc;
+    // TODO: 构造 Length-Field 数据测试
+    return 0;
+}
+```
+
+</details>
+
+## 6.3 Socket 选项与高级特性
+
+- **练习目标**：
+    - 掌握常用 socket 选项：`SO_REUSEADDR`、`SO_REUSEPORT`、`TCP_NODELAY`、`SO_KEEPALIVE`、`SO_LINGER`、`SO_RCVBUF` / `SO_SNDBUF`。
+    - 理解每个选项的生效时机（`listen` 前 / `connect` 前 / 任意时刻）。
+    - 掌握 TCP Keepalive 与应用层心跳的区别。
+- **练习任务**：
+    1. 给服务器加上 `SO_REUSEADDR`，验证重启后不再报 "Address already in use"。
+    2. 用 `SO_REUSEPORT` 实现多进程负载均衡（多个进程 bind 同一端口，内核分配连接）。
+    3. 开启 `TCP_NODELAY`，对比小消息场景下的延迟变化。
+    4. 开启 `SO_KEEPALIVE` 并调整内核参数（`tcp_keepalive_time` / `tcp_keepalive_intvl` / `tcp_keepalive_probes`），验证能检测到对端异常断开。
+    5. 用 `SO_LINGER` 控制 close 时的行为（立即 RST vs 等待发送完毕）。
+- **巩固标准**：
+    - [ ] 能说出 `SO_REUSEADDR` 与 `SO_REUSEPORT` 的区别（前者允许端口复用，后者还负责负载均衡）。
+    - [ ] 能解释 TCP Keepalive 的默认时长（2 小时）为什么不适合应用层，以及应用层心跳的设计要点。
+    - [ ] 能解释 `SO_LINGER` 设置 linger=0 时 close 会发 RST 而非 FIN 的场景。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 6.3 Socket 选项 练习框架 ===
+// 项目结构:
+// 6-3-sockopt/
+// ├── SockOptExercises.h
+// ├── SockOptExercises.cpp
+// └── main.cpp
+
+// ---------- SockOptExercises.h ----------
+#pragma once
+
+// 练习1: SO_REUSEADDR 避免重启报 "Address already in use"
+void reuseAddrServer(int port);
+
+// 练习2: SO_REUSEPORT 实现多进程负载均衡
+void reusePortMultiProcess(int port);
+
+// 练习3: TCP_NODELAY 对比小消息场景下的延迟
+void tcpNoDelayTest(bool enable);
+
+// 练习4: SO_KEEPALIVE 检测对端异常断开
+void keepAliveServer(int port);
+
+// 练习5: SO_LINGER 控制 close 行为
+void lingerTest(bool enableLinger, int lingerSec);
+
+// ---------- SockOptExercises.cpp ----------
+#include "SockOptExercises.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+
+// 练习1
+void reuseAddrServer(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    // TODO: int opt = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // TODO: bind + listen + accept
+    // TODO: 重启程序验证不再报 "Address already in use"
+}
+
+// 练习2
+void reusePortMultiProcess(int port) {
+    // TODO: fork N 个子进程，每个都 socket + setsockopt(SO_REUSEPORT) + bind + listen + accept
+    // TODO: 用客户端并发连接，观察内核把连接分配到不同进程
+}
+
+// 练习3
+void tcpNoDelayTest(bool enable) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    // TODO: int flag = enable ? 1 : 0; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    // TODO: 发送大量 1 字节小包，记录耗时对比
+}
+
+// 练习4
+void keepAliveServer(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    // TODO: int opt = 1; setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+    // TODO: 调整内核参数 tcp_keepalive_time / intvl / probes
+    // TODO: accept 后等待，客户端掉线时验证能检测到
+}
+
+// 练习5
+void lingerTest(bool enableLinger, int lingerSec) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    // TODO: struct linger lg = { enableLinger, lingerSec };
+    // TODO: setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    // TODO: connect 后 close，用 tcpdump 观察是发 FIN 还是 RST
+}
+
+// ---------- main.cpp ----------
+#include "SockOptExercises.h"
+
+int main() {
+    // TODO: 依次测试以上五个练习
+    return 0;
+}
+```
+
+</details>
+
+<details>
+<summary>🧪 测试操作步骤</summary>
+
+> 端口默认 **8888**（可在菜单中自定义）。所有练习共用同一套编译流程，仅菜单选项不同——程序通过 `main.cpp` 的菜单分发：`1`=reuseAddrServer，`2`=reusePortMultiProcess，`3`=tcpNoDelayTest，`4`=keepAliveServer，`5`=lingerTest。
+
+### 练习 2：SO_REUSEPORT 多进程负载均衡
+
+需要 **2 个终端**：终端 A 跑多进程服务端，终端 B 用 `nc` 发起并发连接制造负载。
+
+| 步骤 | 终端 A（服务端） | 终端 B（并发客户端） |
+|------|------------------|----------------------|
+| 1 | 运行程序，输入 `2`，端口回车用默认 8888 | |
+| 2 | fork 出 4 个 worker，各自打印 `[worker PID] listening on port 8888`；父进程打印 `press Ctrl+C to quit` 后阻塞等待 | |
+| 3 | | 执行 `for i in $(seq 1 20); do (echo hi \| nc -q0 127.0.0.1 8888 &); done` 发起 20 条并发短连接 |
+| 4 | 每条连接被某个 worker accept，打印 `[worker PID] connection #N` | |
+| 5 | 观察连接被分散到**不同的 worker PID** 上（大致均匀，小样本下略有偏差属正常） | |
+| 6 | `Ctrl+C` 停止：父进程 `kill(0, SIGTERM)` 通知整个进程组，阻塞 `waitpid` 回收全部 worker，打印 `[parent] all workers exited` 后退出 | |
+
+**验证要点**：4 个进程能同时 `bind` 同一端口 8888 而不报 `Address already in use`，正是 `SO_REUSEPORT` 的作用；内核按连接四元组哈希把新连接分配到某个监听 socket，因此并发连接会分散到不同 worker。退出后可用 `ps aux \| grep sockopt` 确认无残留 / 僵尸进程。
+
+> 💡 **与练习 1 的 `SO_REUSEADDR` 区别**：`SO_REUSEADDR` 只解决「端口处于 TIME_WAIT 时无法重新 bind」，同一时刻仍只允许一个监听 socket；`SO_REUSEPORT` 则允许多个 socket 同时 bind 同一端口，并由内核负责把连接负载均衡到这些 socket 上。
+
+### 练习 4：SO_KEEPALIVE 检测对端异常断开
+
+需要 **2 个终端**：终端 A 运行服务端，终端 B 用 `nc` 连接后模拟异常断开。代码中 keepalive 参数为 `idle=5s, intvl=2s, probes=3`，即空闲 5 秒后开始探测，每 2 秒探测一次，共 3 次，总计约 **11 秒**检测到断连。
+
+**方法 A：`iptables` 丢包模拟网络中断（推荐，可观察完整 keepalive 超时）**
+
+> 需要 `sudo` 权限。原理：用 `iptables` 丢弃目标端口 8888 的所有出站包，使服务端发出的 keepalive 探测包无法到达客户端，从而触发完整超时。
+
+| 步骤 | 终端 A（服务端） | 终端 B（客户端 / iptables） |
+|------|------------------|---------------------------|
+| 1 | 运行程序，输入 `4`，端口回车用默认 8888 | |
+| 2 | 打印 `listening on port 8888 ...` | |
+| 3 | | 执行 `nc 127.0.0.1 8888` 建立连接 |
+| 4 | 打印 `client connected, keepalive: idle = 5s intvl=2s probes=3` | |
+| 5 | | 新开终端 C，执行 `sudo iptables -A OUTPUT -p tcp --dport 8888 -j DROP` 丢弃所有发往 8888 端口的包 |
+| 6 | 保持等待，约 **11 秒**后 `read` 返回 -1，打印 `read (keepalive detected peer death): Connection timed out` | |
+| 7 | | 执行 `sudo iptables -F` 清除规则，恢复网络 |
+
+**验证要点**：服务端在约 11 秒后检测到断连，正是 `idle + intvl × probes = 5 + 2×3 = 11` 秒的 keepalive 超时时间。`errno` 为 `ETIMEDOUT`（Connection timed out），说明是 keepalive 探测超时而非对端主动关闭。
+
+> 💡 **为什么需要 `iptables`？** 如果直接 `kill -9 nc`，内核会立即发送 RST 包，服务端瞬间收到 `ECONNRESET` 而检测到断连——这走的是 RST 快速路径，**不经过 keepalive 机制**。`iptables` 丢弃出站包后，服务端的探测包被丢弃、对端无法回复，才能触发完整的 keepalive 超时流程。
+
+**方法 B：`kill -9` 快速验证（检测异常退出路径）**
+
+| 步骤 | 终端 A（服务端） | 终端 B（客户端） |
+|------|------------------|------------------|
+| 1 | 运行程序，输入 `4`，端口回车用默认 8888 | |
+| 2 | 打印 `listening on port 8888 ...` | |
+| 3 | | 执行 `nc 127.0.0.1 8888` 建立连接 |
+| 4 | 打印 `client connected, keepalive: idle = 5s intvl=2s probes=3` | |
+| 5 | | 另开终端 C，执行 `kill -9 $(pgrep -f 'nc 127.0.0.1')` 强杀 nc |
+| 6 | **立即**打印 `client disconnected (normal close)`（若 nc 有未读数据则打印 `read (keepalive detected peer death): Connection reset by peer`） | nc 被 Killed |
+
+**验证要点**：`kill -9` 后内核立即关闭 socket 并发送 FIN 或 RST（取决于 nc 接收缓冲区是否有未读数据），服务端 `read` **立即**返回而非等待 11 秒 keepalive 超时。此路径**不经过 keepalive 机制**，但验证了服务端能快速感知对端进程异常退出。
+
+> 💡 **FIN vs RST 的触发条件**：`kill -9` 时，若进程 TCP 接收队列为空，内核发送 FIN（正常关闭语义，`read` 返回 0）；若接收队列中有未读数据，内核发送 RST（异常重置，`read` 返回 -1 且 `errno = ECONNRESET`）。本练习 `nc` 连接后无数据传输，因此走 FIN 路径。
+
+> 💡 **方法 A vs 方法 B**：方法 A 验证 keepalive 的完整超时机制（约 11 秒延迟检测），方法 B 验证 RST 快速检测路径（立即检测）。实际生产中，keepalive 主要用于检测**网络中断、对端宕机**等不发 RST 的场景；正常进程退出时内核总会发送 RST，无需等 keepalive。
+
+### 练习 5：SO_LINGER 控制 close 行为
+
+需要 **2 个终端**：终端 A 运行程序，终端 B 用 `tcpdump` 抓包观察关闭连接时发 FIN 还是 RST。程序内部 `fork` 子进程充当 echo 服务器（端口 19899），父进程作为客户端设置 `SO_LINGER` 后连接、发送数据、关闭。
+
+**场景 A：`linger=0`（立即 RST，异常重置）**
+
+> 需要 `sudo` 权限运行 `tcpdump`。
+
+| 步骤 | 终端 A（程序） | 终端 B（tcpdump 抓包） |
+|------|---------------|----------------------|
+| 1 | | 执行 `sudo tcpdump -i lo -nn 'tcp port 19899'` 开始抓包 |
+| 2 | 运行程序，输入 `5` | |
+| 3 | 启用 SO_LINGER 输入 `1`，linger 秒数输入 `0` | |
+| 4 | 打印 `SO_LINGER: l_onoff=1, l_linger=0` | |
+| 5 | 打印 `closing socket...` | 观察抓包结果 |
+| 6 | 程序退出 | 最后一行看到 `Flags [R.]`（**RST**），**无四次挥手** |
+
+**验证要点**：`l_onoff=1, l_linger=0` 使 `close()` 立即发送 RST 而非 FIN，连接被一步强制重置。对端 `read()` 会返回 `-1` 且 `errno = ECONNRESET`，而非返回 `0`（EOF）。
+
+**场景 B：默认行为（优雅 FIN 关闭）**
+
+| 步骤 | 终端 A（程序） | 终端 B（tcpdump 抓包） |
+|------|---------------|----------------------|
+| 1 | | 执行 `sudo tcpdump -i lo -nn 'tcp port 19899'` 开始抓包 |
+| 2 | 运行程序，输入 `5` | |
+| 3 | 启用 SO_LINGER 输入 `0`，linger 秒数回车用默认 `0` | |
+| 4 | 打印 `SO_LINGER: l_onoff=0, l_linger=0` | |
+| 5 | 打印 `closing socket...` | 观察抓包结果 |
+| 6 | 程序退出 | 最后三行看到 `Flags [F.]` → `Flags [F.]` → `Flags [.]`（**标准四次挥手**） |
+
+**验证要点**：`l_onoff=0` 为默认行为，`close()` 正常发送 FIN 启动四次挥手（FIN → ACK → FIN → ACK），对端 `read()` 返回 `0`（EOF）。
+
+> 💡 **RST vs FIN 的本质区别**：FIN 是「我说完了」的优雅关闭语义，对端仍可发送剩余数据；RST 是「连接作废」的异常信号，双方立即释放连接资源，未传数据直接丢弃。`SO_LINGER` 的 `linger=0` 是唯一让内核发 RST 而非 FIN 的场景，适用于需要立即踢掉对端的场景（如服务器主动断开恶意客户端）。
+
+</details>
+
+## 6.4 心跳、超时与优雅退出
+
+- **练习目标**：
+    - 掌握应用层心跳协议设计（ping / pong 消息、超时判定、重试策略）。
+    - 掌握读写超时的三种实现：`SO_RCVTIMEO` / `SO_SNDTIMEO`、`select` / `poll` 超时、epoll + 定时器。
+    - 理解"优雅退出"的完整流程：停止接收新连接 → 等待 in-flight 请求处理完 → 关闭旧连接。
+- **练习任务**：
+    1. 设计一个心跳协议：客户端每 10 秒发 PING，服务端 30 秒未收到任何消息则断开。
+    2. 用 epoll + 最小堆定时器实现"连接超时检测"：每个连接记录最后活跃时间，定时扫描超时连接。
+    3. 实现服务器的优雅退出：捕获 SIGTERM 后停止 accept，等待所有连接空闲或超时后退出。
+    4. 用 `shutdown(fd, SHUT_WR)` 实现半关闭，验证对端能读完剩余数据后收到 EOF。
+- **巩固标准**：
+    - [ ] 能画出"心跳超时检测"的定时器堆变化过程。
+    > **知识讲解**：定时器堆底层是 `std::priority_queue<TimerNode, vector<TimerNode>, greater<TimerNode>>`（最小堆），每个 `TimerNode` 存 `{fd, expireMs}`，按过期时间升序排列，堆顶永远是**最近到期**的定时器。变化过程：① 新连接 `accept` 后入堆，`expireMs = now + timeout`；② 收到客户端消息（心跳续期）时，**不删除旧节点**，而是直接 `push` 一个新的 `TimerNode`（同一个 fd 在堆中有多条记录）；③ `timerLoop()` 每次从堆顶弹出，先做**惰性检查**——`lastActive_` 中找不到该 fd（已关闭）则跳过，`lastActive_[fd] + timeout > now`（已续期，实际过期时间还没到）也跳过。这种"惰性删除"策略避免了 `priority_queue` 无法高效删除中间元素的限制（标准库无 `remove` 操作），代价是堆中可能存在过期冗余节点，但每个节点最多被弹出一次，总体复杂度仍为 O(n log n)。
+    - [ ] 能解释 `close()` 与 `shutdown()` 的区别（前者销毁 FD，后者只关闭方向）。
+    > **知识讲解**：`close(fd)` 销毁文件描述符并释放内核中该 fd 的全部资源，同时向对端发送 FIN 启动四次挥手（完全关闭读写两个方向），调用后 fd 不可再使用。`shutdown(fd, how)` 只关闭连接的**指定方向**，fd 本身仍然有效：`SHUT_RD` 关闭读端（后续 `read` 返回 0，但不影响发送 FIN）、`SHUT_WR` 关闭写端（向对端发送 FIN，对端 `read` 最终返回 0/EOF，但本端仍可 `read`）、`SHUT_RDWR` 同时关闭两个方向。核心区别：`close` 是**资源管理**操作（释放 fd + 关闭连接），`shutdown` 是**连接控制**操作（精细控制方向）。典型场景：服务器处理完请求后 `shutdown(fd, SHUT_WR)` 发送 FIN 告知"我说完了"，客户端读完剩余数据后收到 EOF，实现"半关闭"优雅结束——这是 `close` 无法做到的，因为 `close` 会同时关闭读端，无法再读取客户端可能发送的剩余数据。注意 `close` 有引用计数：如果 fd 被 `fork` 复制到多个进程，只有所有副本都 `close` 后内核才真正发送 FIN。
+    - [ ] 能说明为什么"in-flight 请求"必须处理完才能退出（避免客户端收到不完整响应）。
+    > **知识讲解**：in-flight 请求指服务器已经接收但**尚未处理完毕**的请求——可能正在查数据库、计算结果、或 `send` 到一半被中断。如果此时直接 `close` 退出，客户端会收到不完整响应（截断的 JSON、半条消息）或连接被重置（RST），导致客户端解析失败、数据丢失、用户体验差。优雅退出的完整流程：① 捕获 `SIGTERM`/`SIGINT` 后设置 `running_ = false`，停止 `accept` 新连接（不再接待新客人）；② 继续事件循环，等待所有已连接客户端的请求处理完毕或超时断开（把在座的客人服务完）；③ 所有连接关闭后，再 `close` 监听 socket 和 epoll 实例（关门打烊）。本练习中通过 `eventfd` + `gracefulShutdown()` 实现：信号处理函数设置标志位并写 `eventfd` 唤醒 `epoll_wait`（避免阻塞在超时上），主循环检查 `running_` 退出后统一清理。如果服务器承载长连接（如 WebSocket、聊天室），还需考虑主动给客户端发送"服务器即将关闭"的通知消息，让客户端有机会重连其他节点。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 6.4 心跳、超时与优雅退出 练习框架 ===
+// 项目结构:
+// 6-4-heartbeat/
+// ├── HeartbeatServer.h
+// ├── HeartbeatServer.cpp
+// └── main.cpp
+
+// ---------- HeartbeatServer.h ----------
+#pragma once
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// 最小堆定时器：每个连接记录最后活跃时间
+struct TimerNode {
+    int fd;
+    int64_t expireMs;  // 绝对过期时间（毫秒）
+    bool operator>(const TimerNode& o) const { return expireMs > o.expireMs; }
+};
+
+class HeartbeatServer {
+public:
+    HeartbeatServer(int port, int heartbeatIntervalSec = 10, int timeoutSec = 30);
+    void start();
+    void gracefulShutdown();  // 练习3
+
+private:
+    void onNewConnection(int fd);
+    void onReadable(int fd);
+    void onClose(int fd);
+    void processMessage(int fd, const std::string& msg);
+    void timerLoop();  // 练习2
+
+    int port_;
+    int heartbeatIntervalSec_;
+    int timeoutSec_;
+    std::atomic<bool> running_{true};
+    int listenFd_{-1};
+    int epollFd_{-1};
+    int wakeupFd_{-1};  // eventfd，供信号处理函数唤醒 epoll_wait
+    std::unordered_map<int, int64_t> lastActive_;  // fd -> 最后活跃时间
+    std::priority_queue<TimerNode, std::vector<TimerNode>, std::greater<TimerNode>> timerHeap_;
+};
+
+// 练习4: shutdown 半关闭测试
+void halfCloseDemo();
+
+// ---------- HeartbeatServer.cpp ----------
+#include "HeartbeatServer.h"
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+static int64_t nowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+HeartbeatServer::HeartbeatServer(int port, int hb, int to)
+    : port_(port), heartbeatIntervalSec_(hb), timeoutSec_(to) {}
+
+void HeartbeatServer::start() {
+    // TODO: socket + setsockopt(SO_REUSEADDR) + bind + listen
+    // TODO: fcntl 设置 listenFd 为非阻塞（否则 accept 循环会卡死）
+    // TODO: epoll_create1 + 把 listenFd 加入监听
+    // TODO: eventfd 创建 wakeupFd_，加入 epoll（用于信号唤醒）
+    // TODO: while (running_) {
+    //   epoll_wait 超时 = 最近一个定时器的剩余时间
+    //   处理事件（listenFd / wakeupFd_ / 客户端 fd）
+    //   扫描超时连接并关闭
+    // }
+}
+
+void HeartbeatServer::onNewConnection(int fd) {
+    // TODO: 加入 epoll，记录 lastActive_[fd] = nowMs()
+    // TODO: 加入 timerHeap_，expire = nowMs + timeoutSec*1000
+}
+
+void HeartbeatServer::onReadable(int fd) {
+    // TODO: read 数据
+    // TODO: 如果读到 PING 或任何消息，更新 lastActive_[fd]，重新加入 timerHeap_
+    // TODO: 处理业务消息
+}
+
+void HeartbeatServer::onClose(int fd) {
+    // TODO: epoll_ctl DEL, close(fd), lastActive_.erase(fd)
+}
+
+void HeartbeatServer::processMessage(int fd, const std::string& msg) {
+    // TODO: 回包或业务处理
+}
+
+void HeartbeatServer::gracefulShutdown() {
+    // 注意：此函数从信号处理函数调用，只能使用 async-signal-safe 操作
+    // TODO: running_ = false
+    // TODO: 往 eventfd 写一个值，唤醒 server 线程的 epoll_wait
+}
+
+void HeartbeatServer::timerLoop() {
+    // TODO: while (!timerHeap_.empty() && timerHeap_.top().expireMs <= nowMs()) {
+    //   取出 fd，检查 lastActive_[fd] 是否真的过期
+    //   若过期则 close(fd)
+    // }
+}
+
+// 练习4
+void halfCloseDemo() {
+    int sv[2];
+    // TODO: socketpair(AF_UNIX, SOCK_STREAM, 0, sv)
+    // TODO: 一端 shutdown(fd, SHUT_WR)
+    // TODO: 另一端 read 直到返回 0（EOF），验证仍能继续写回
+}
+
+// ---------- main.cpp ----------
+#include "HeartbeatServer.h"
+
+int main() {
+    HeartbeatServer server(8888);
+    // TODO: 启动服务器，用客户端连接后停止发送消息，观察超时断开
+    // TODO: 测试 gracefulShutdown
+    return 0;
+}
+```
+
+</details>
+
+## 6.5 IO 多路复用对比与 Reactor 模式
+
+- **练习目标**：
+    - 对比 select / poll / epoll / io_uring 的原理、性能特征、适用场景。
+    - 理解 Reactor 模式的三种变体：单线程 Reactor、多线程 Reactor、主从 Reactor（main-reactor + sub-reactor）。
+    - 理解 Proactor 模式（异步 IO）与 Reactor（同步 IO 就绪通知）的区别。
+    - 能设计 Acceptor + Worker 的经典服务器架构。
+- **练习任务**：
+    1. 用 select / poll / epoll 分别实现同一个 echo 服务器，对比代码复杂度与性能。
+    2. 实现单线程 Reactor：一个线程负责 accept + read + write。
+    3. 实现主从 Reactor：main-reactor 只负责 accept，把新连接交给 sub-reactor 处理。
+    4. 实现主从 Reactor + 线程池：sub-reactor 把 IO 事件派发给线程池执行（IO 与业务分离）。
+    5. 用 `sysbench` 或自写压测工具，对比四种架构的 QPS 与延迟。
+- **巩固标准**：
+    - [ ] 能画出 select / poll / epoll 的内核遍历方式差异（线性遍历 vs 红黑树 + 就绪链表）。
+      > **知识讲解**：差异在于**内核如何管理 fd 及告知就绪事件**。**select/poll**：每次调用都要把全量 fd 集合拷贝进内核，内核**线性遍历**所有 fd 逐个探测就绪，返回后用户态还要再遍历一遍找就绪 fd，复杂度 O(监控总数)；poll 仅去掉了 select 的 `FD_SETSIZE`（1024）硬限制，遍历本质没变。**epoll**：`epoll_ctl` 把 fd **一次性**注册到内核的**红黑树**中；数据到达时由中断路径触发回调（`ep_poll_callback`）将就绪 fd 挂入**就绪链表**；`epoll_wait` 只把就绪链表拷贝返回，复杂度降为 O(就绪数)。这就是 epoll 在高并发场景性能碾压的根本原因——10 万连接、每秒 5 千活跃时，select/poll 每次扫 10 万个 fd，epoll 只处理 5 千个。
+    - [ ] 能解释 epoll 的 LT（水平触发）与 ET（边缘触发）的区别，以及各自的使用场景。
+      > **知识讲解**：区别在于**就绪通知的触发时机**。LT（默认）：只要内核缓冲区**还有数据未读完**，每次 `epoll_wait` 都会**重复报告**，允许一次只读一部分。ET：只在状态**发生跳变的边缘**（无数据→有数据）报告一次，之后即使有剩余数据也不再通知。因此 ET 有两条铁律：① fd 必须设为**非阻塞**（O_NONBLOCK），否则最后一次 `read` 会阻塞线程；② 事件到来后必须**循环读到 `EAGAIN`**，否则漏事件。场景：LT 编程简单、容错性好，适合大多数业务服务器；ET 减少重复唤醒，性能更好，Nginx、Redis 及本练习的 6-5-reactor 均用 ET。易错点：ET 下用 if 而不是 while 读、忘设非阻塞、accept 只接受一个连接是三大经典 bug。
+    - [ ] 能说出 Redis、Nginx、Netty 分别使用哪种 Reactor 模型。
+      > **知识讲解**：**Redis——单线程 Reactor**：主线程用 epoll 监听所有事件（accept + 读写 + 定时器），命令在同一线程串行执行。成立前提是命令为**纯内存操作、耗时极短**，单线程反而避免锁竞争并天然保证原子性；代价是慢命令（大 key `DEL`）会阻塞整个实例，需 `UNLINK`/lazyfree 异步化。**Nginx——多进程 each-reactor**：master 不处理连接，每个 worker 进程持有独立的单线程 Reactor（accept + read + write + 业务同线程），通过 `SO_REUSEPORT`（或共享监听 fd + `accept_mutex`）分担新连接，worker 数 = CPU 核数，进程隔离无锁竞争。**Netty——主从多线程 Reactor**：boss 线程组（main-reactor）只负责 accept，把连接注册到 worker 线程组（sub-reactor）的某个 EventLoop，该连接的读写由固定线程处理，耗时业务再提交给独立**业务线程池**，实现 IO 与业务分离（即练习任务 4 的架构）。一句话对比：Redis 是"1 个 Reactor 干所有事"，Nginx 是"N 个互不相干的进程级 Reactor"，Netty 是"1 main + N sub + 业务线程池"。
+    - [ ] 能解释 io_uring 相比 epoll 的优势（真正的异步、批量提交、共享环形缓冲区）。
+      > **知识讲解**：io_uring（Linux 5.1 引入）从三个层面突破 epoll 的上限。**① 真正的异步**：epoll 本质是"就绪通知"——`epoll_wait` 只告诉你"fd 可以读了"，数据搬运仍需自己调 `read`/`write`；io_uring 提交 SQE（如 `IORING_OP_READ`）后，内核把数据**直接搬运到你指定的缓冲区**并通过 CQE 通知完成，应用拿到的就是结果数据本身。**② 批量提交/收割**：SQE（提交队列）/CQE（完成队列）放在**用户态与内核态共享（mmap）的环形缓冲区**里，一次 `io_uring_submit` 可提交多个操作，收割 CQE 甚至可**零系统调用**（内核直接写入 CQ 环，应用轮询即可），把系统调用次数从 O(操作数) 降为接近 O(1)。**③ 附带收益**：支持超时、链式依赖（`IOSQE_IO_LINK`）、零拷贝发送（`SEND_ZC`）、注册固定缓冲区/fd。代价：接口比 epoll 复杂得多，且部分内核版本有安全漏洞历史；高吞吐存储引擎、代理网关是典型受益者，工程上建议用 liburing 库而非裸 syscall。
+
+<details>
+<summary>📦 练习框架代码</summary>
+
+```cpp
+// === 6.5 Reactor 模式 练习框架 ===
+// 项目结构:
+// 6-5-reactor/
+// ├── Channel.h
+// ├── Channel.cpp
+// ├── EventLoop.h
+// ├── EventLoop.cpp
+// ├── Acceptor.h
+// ├── Acceptor.cpp
+// ├── EchoServer.h
+// ├── EchoServer.cpp
+// └── main.cpp
+
+// ---------- Channel.h ----------
+#pragma once
+#include <functional>
+
+class EventLoop;
+
+// 封装 fd + 关注事件 + 回调
+class Channel {
+public:
+    using EventCallback = std::function<void()>;
+    Channel(EventLoop* loop, int fd);
+    void setReadCallback(EventCallback cb)  { readCb_ = std::move(cb); }
+    void setWriteCallback(EventCallback cb) { writeCb_ = std::move(cb); }
+    void setCloseCallback(EventCallback cb) { closeCb_ = std::move(cb); }
+    void setErrorCallback(EventCallback cb) { errorCb_ = std::move(cb); }
+    void enableReading(bool on = true);
+    void enableWriting(bool on = true);
+    void handleEvent(int revents);  // 由 EventLoop 调用
+    int fd() const { return fd_; }
+    int events() const { return events_; }  // 返回当前关注的 epoll 事件掩码
+
+private:
+    EventLoop* loop_;
+    int fd_;
+    int events_{0};  // 当前关注的 epoll 事件掩码
+    EventCallback readCb_, writeCb_, closeCb_, errorCb_;
+};
+
+// ---------- Channel.cpp ----------
+#include "Channel.h"
+#include "EventLoop.h"
+#include <sys/epoll.h>
+
+Channel::Channel(EventLoop* loop, int fd) : loop_(loop), fd_(fd) {}
+
+void Channel::enableReading(bool on) {
+    // TODO: 根据 on 设置 events_ |= EPOLLIN | EPOLLET 或 events_ &= ~(EPOLLIN | EPOLLET)
+    // TODO: 调用 loop_->updateChannel(this)
+}
+
+void Channel::enableWriting(bool on) {
+    // TODO: 根据 on 设置 events_ |= EPOLLOUT 或 events_ &= ~EPOLLOUT
+    // TODO: 调用 loop_->updateChannel(this)
+}
+
+void Channel::handleEvent(int revents) {
+    // TODO: 根据 revents 位调用对应回调
+    // EPOLLERR | EPOLLHUP → errorCb_
+    // EPOLLRDHUP         → closeCb_
+    // EPOLLIN            → readCb_
+    // EPOLLOUT           → writeCb_
+}
+
+// ---------- EventLoop.h ----------
+#pragma once
+#include <atomic>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <queue>
+#include <thread>
+
+class Channel;
+
+class EventLoop {
+public:
+    EventLoop();
+    ~EventLoop();
+    void loop();
+    void quit();
+    void updateChannel(Channel* ch);
+    void removeChannel(Channel* ch);
+    // 练习2：跨线程投递任务
+    void runInLoop(std::function<void()> fn);
+    void queueInLoop(std::function<void()> fn);
+
+private:
+    void wakeup();  // 练习2：eventfd 唤醒
+    void handlePendingTasks();
+
+    int epollFd_;
+    int wakeupFd_;  // eventfd
+    std::atomic<bool> quit_{false};
+    std::thread::id threadId_;  // 所属线程 ID，用于 runInLoop 判断
+    std::mutex mtx_;
+    std::queue<std::function<void()>> pendingTasks_;
+    std::map<int, Channel*> channels_;  // fd -> Channel
+};
+
+// ---------- EventLoop.cpp ----------
+#include "EventLoop.h"
+#include "Channel.h"
+#include <cstdlib>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <thread>
+#include <unistd.h>
+#include <array>
+#include <utility>
+
+EventLoop::EventLoop() : threadId_(std::this_thread::get_id()) {
+    // TODO: epoll_create1(0) 创建 epoll 实例
+    // TODO: eventfd(0, EFD_NONBLOCK) 创建唤醒 fd
+    // TODO: 将 wakeupFd_ 注册到 epoll，监听 EPOLLIN
+}
+
+EventLoop::~EventLoop() {
+    // TODO: 先从 epoll 移除 wakeupFd_，再 close(wakeupFd_) 和 close(epollFd_)
+}
+
+void EventLoop::loop() {
+    std::array<struct epoll_event, 1024> events;
+    while (!quit_) {
+        // TODO: epoll_wait 阻塞等待事件（注意处理 EINTR）
+        // TODO: 遍历就绪事件
+        //   - 如果是 wakeupFd_ 触发：读取 eventfd 并调用 handlePendingTasks()
+        //   - 否则：通过 channels_ 找到 Channel，调用 ch->handleEvent(ev.events)
+    }
+}
+
+void EventLoop::quit() {
+    quit_ = true;
+    wakeup();  // 唤醒阻塞在 epoll_wait 的线程
+}
+
+void EventLoop::updateChannel(Channel* ch) {
+    // TODO: 构造 epoll_event，设置 ch->events() 和 ch->fd()
+    // TODO: 如果 channels_ 中没有此 Channel → epoll_ctl EPOLL_CTL_ADD
+    // TODO: 如果已存在 → epoll_ctl EPOLL_CTL_MOD
+    // TODO: 更新 channels_[ch->fd()] = ch
+}
+
+void EventLoop::removeChannel(Channel* ch) {
+    // TODO: epoll_ctl EPOLL_CTL_DEL，然后 channels_.erase(ch->fd())
+}
+
+void EventLoop::wakeup() {
+    // TODO: uint64_t val = 1; write(wakeupFd_, &val, sizeof(val)) 唤醒 epoll_wait
+}
+
+void EventLoop::runInLoop(std::function<void()> fn) {
+    // TODO: 如果当前线程 == threadId_ 则直接执行 fn()
+    // TODO: 否则调用 queueInLoop(std::move(fn))
+}
+
+void EventLoop::queueInLoop(std::function<void()> fn) {
+    // TODO: 加锁 push 到 pendingTasks_，然后调用 wakeup()
+}
+
+void EventLoop::handlePendingTasks() {
+    // TODO: 加锁 swap 出 pendingTasks_，逐个执行
+}
+
+// ---------- Acceptor.h ----------
+#pragma once
+#include <functional>
+#include <utility>
+
+class EventLoop;
+class Channel;
+
+class Acceptor {
+public:
+    using NewConnCallback = std::function<void(int fd)>;
+    Acceptor(EventLoop* loop, int port);
+    ~Acceptor();
+    void setNewConnCallback(NewConnCallback cb) { newConnCb_ = std::move(cb); }
+    void listen();
+
+private:
+    void handleRead();
+    EventLoop* loop_;
+    Channel* acceptChannel_;
+    int listenFd_;
+    NewConnCallback newConnCb_;
+};
+
+// ---------- Acceptor.cpp ----------
+#include "Acceptor.h"
+#include "EventLoop.h"
+#include "Channel.h"
+#include <cstdio>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+Acceptor::Acceptor(EventLoop* loop, int port) : loop_(loop) {
+    // TODO: socket(AF_INET, SOCK_STREAM, 0) 创建监听 socket
+    // TODO: setsockopt SO_REUSEADDR
+    // TODO: bind 到 0.0.0.0:port
+    // TODO: fcntl 设置非阻塞
+    // TODO: acceptChannel_ = new Channel(loop_, listenFd_)
+    // TODO: acceptChannel_->setReadCallback([this]() { handleRead(); })
+}
+
+Acceptor::~Acceptor() {
+    // TODO: loop_->removeChannel(acceptChannel_), delete acceptChannel_, close(listenFd_)
+}
+
+void Acceptor::listen() {
+    // TODO: ::listen(listenFd_, SOMAXCONN)
+    // TODO: acceptChannel_->enableReading()
+}
+
+void Acceptor::handleRead() {
+    // ET 模式下需要循环 accept 直到 EAGAIN
+    while (true) {
+        // TODO: accept4(listenFd_, ..., SOCK_NONBLOCK) 接受新连接
+        // TODO: connFd < 0 时，EAGAIN/EWOULDBLOCK 则 break，EINTR 则 continue
+        // TODO: 调用 newConnCb_(connFd)
+    }
+}
+
+// ---------- EchoServer.h ----------
+#pragma once
+#include <memory>
+#include <mutex>
+#include <vector>
+#include <thread>
+#include <map>
+
+class EventLoop;
+class Acceptor;
+class Channel;
+
+// 练习3：主从 Reactor 模型
+struct TcpConnection {
+    int fd;
+    Channel* channel;
+    EventLoop* loop;
+    char buf[4096];
+};
+
+class EchoServer {
+public:
+    EchoServer(int port, int subReactorCount = 3);
+    ~EchoServer();
+    void start();
+    void stop();
+
+private:
+    void onNewConnection(int fd);
+    void handleRead(TcpConnection* conn);
+    void removeConnection(TcpConnection* conn);
+
+    std::unique_ptr<EventLoop> mainLoop_;
+    std::unique_ptr<Acceptor> acceptor_;
+    std::vector<std::unique_ptr<EventLoop>> subLoops_;
+    std::vector<std::thread> threads_;
+    int nextSub_{0};
+    std::mutex connMtx_;
+    std::map<int, std::unique_ptr<TcpConnection>> connections_;  // fd -> conn
+};
+
+// ---------- EchoServer.cpp ----------
+#include "EchoServer.h"
+#include "EventLoop.h"
+#include "Acceptor.h"
+#include "Channel.h"
+#include <cstddef>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <sys/socket.h>
+#include <unistd.h>
+
+EchoServer::EchoServer(int port, int subReactorCount) {
+    mainLoop_ = std::make_unique<EventLoop>();
+    // TODO: 创建 subReactorCount 个 subLoop
+    // TODO: 创建 acceptor_，设置 newConnCallback 调用 onNewConnection
+}
+
+EchoServer::~EchoServer() {
+    // TODO: 清理仍活跃的连接（removeChannel、delete channel、close fd）
+    // TODO: 退出所有 sub-reactor，join 所有线程
+}
+
+void EchoServer::start() {
+    // TODO: 为每个 subLoop 启动独立线程运行 loop()
+    // TODO: acceptor_->listen()
+    // TODO: mainLoop_->loop() 在当前线程运行
+}
+
+void EchoServer::onNewConnection(int fd) {
+    // TODO: Round-Robin 选择 subLoops_[nextSub_]
+    // TODO: sub->runInLoop 在 sub-reactor 线程中：
+    //   1. 创建 TcpConnection，设置 fd、loop、channel
+    //   2. 设置 channel 的 readCallback 和 closeCallback
+    //   3. channel->enableReading()
+    //   4. 加锁存入 connections_
+}
+
+void EchoServer::handleRead(TcpConnection* conn) {
+    // ET 模式：循环读取直到 EAGAIN
+    while (true) {
+        // TODO: recv 读取数据
+        //   n > 0: send 回显
+        //   n == 0: 对端关闭，break
+        //   n < 0: EAGAIN/EWOULDBLOCK 则 break，EINTR 则 continue
+    }
+}
+
+void EchoServer::removeConnection(TcpConnection* conn) {
+    // TODO: 在所属 sub-reactor 线程中安全移除：
+    //   加锁从 connections_ 找到并移除
+    //   removeChannel、delete channel、close fd
+}
+
+// ---------- main.cpp ----------
+#include "EchoServer.h"
+#include <csignal>
+
+// TODO: 声明全局 EchoServer* g_server 指针，供信号处理器访问
+// TODO: 实现 signalHandler：调用 g_server->stop()
+
+int main() {
+    EchoServer server(8888, 3);
+    // TODO: 设置 g_server = &server，注册 signal(SIGINT, signalHandler)
+    server.start(); // Ctrl+C → handler → quit() → wakeup → loop() 退出 → 析构
+    return 0;
+}
+```
+
+</details>
+
+#### 测试步骤
+
+需要 **2 个终端**：
+
+| 步骤 | 终端 A（服务器） | 终端 B（客户端） |
+|------|------------------|------------------|
+| 1 | 编译运行 `./reactor` | |
+| 2 | 打印 `EchoServer started on port, 3 sub-reactors`（主从 Reactor 启动完成） | |
+| 3 | | 新开终端执行 `nc localhost 8888` |
+| 4 | | 输入 `hello` 回车 |
+| 5 | | 看到服务器回显 `hello` |
+| 6 | | 再输入 `world` 回车 |
+| 7 | | 看到服务器回显 `world` |
+| 8 | | `Ctrl+D` 或 `Ctrl+C` 关闭连接 |
+| 9 | 无输出（静默 close，连接从 connections_ 移除） | |
+
+**验证要点**：
+
+- **多连接并发**：新开多个终端分别 `nc localhost 8888`，每个连接都能独立收发回显，互不干扰——说明连接被 Round-Robin 分配到不同的 sub-reactor 线程。
+- **主从 Reactor 分工**：main-reactor 只负责 accept 新连接（不处理读写），连接建立后读写事件由所属 sub-reactor 处理——这是 Netty 主从 Reactor 模型的经典实现。
+- **ET 模式行为**：服务器使用 `EPOLLET` 边缘触发，`handleRead` 必须循环读到 `EAGAIN` 为止，否则会漏事件；这也是本练习的核心练习点。
+- **优雅关闭**：服务器 `Ctrl+C` 退出时，析构函数会 `quit()` 所有 sub-reactor 并 `join` 工作线程，无僵尸线程或内存泄漏。
+
+---

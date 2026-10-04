@@ -1,0 +1,309 @@
+sequenceDiagram
+    actor User
+    participant main
+    participant EchoServer
+    participant EventLoop
+    participant Acceptor
+    participant Channel
+
+    Note over main,EchoServer: 构造 EchoServer 对象
+    main ->>+ EchoServer: EchoServer server(...);
+    EchoServer ->>+ EventLoop: mainLoop_ = std::make_unique<EventLoop>();
+        Note over EventLoop: threadId_ = std::this_thread::get_id();
+        Note over EventLoop: // 创建 epoll 实例<br>epollFd_ = epoll_create1(0);
+        Note over EventLoop: // 创建唤醒 fd<br>wakeupFd_ = eventfd(0, EFD_NONBLOCK);
+        Note over EventLoop: // 注册 wakeupFd_ 到 epoll，监听 EPOLLIN<br>epoll_ctl(epollFd_, EPOLL_CTL_ADD, wakeupFd_, &ev{EPOLLIN,wakeupFd_})
+    EventLoop -->>- EchoServer: [nul]
+
+    Note over EchoServer: // 创建 subLoop，之后每个独立线程运行
+    loop for i in [0, subReactorCount)
+        EchoServer ->>+ EventLoop: subLoops_[i] = std::make_unique<EventLoop>();
+        Note over EchoServer,EventLoop: 同 mainLoop_ 创建过程
+        EventLoop -->>- EchoServer: [nul]
+    end
+
+    EchoServer ->>+ Acceptor: acceptor_ = std::make_unique<Acceptor>(mainLoop_.get(), port);
+        Note over Acceptor: loop_ = loop{mainLoop_.get()};
+        Note over Acceptor: // 创建监听 socket<br>listenFd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        Note over Acceptor: // setsockopt 设置 SO_REUSEADDR 地址复用
+        Note over Acceptor: // bind 到 0.0.0.0:port
+        Note over Acceptor: // fcntl 设置非阻塞<br>int flags = ::fcntl(listenFd_, F_GETFL, 0)<br>::fcntl(listenFd_, F_SETFL, flags | O_NONBLOCK);
+
+        Acceptor ->>+ Channel: acceptChannel_ = new Channel(loop_, listenFd_);
+            Note over Channel: loop_ = loop{loop_}<br>fd_ = fd{listenFd_};
+        Channel -->>- Acceptor: [nul]
+        Acceptor ->>+ Channel: acceptChannel_->setReadCallback([this]() { this->handleRead()#59; });
+            Note over Channel: readCb_ = std::move(cb{Acceptor::handleRead()});
+        Channel -->>- Acceptor: [nul]
+    Acceptor -->>- EchoServer: [nul]
+
+    EchoServer ->>+ Acceptor: acceptor_->setNewConnCallback([this](int fd) { this->onNewConnection(fd)#59; });
+        Note over Acceptor: newConnCb_ = std::move(cb{EchoServer::onNewConnection()});
+    Acceptor -->>- EchoServer: [nul]
+    EchoServer -->>- main: 构造完成
+
+    Note over main,EchoServer: 启动 EchoServer
+    main ->>+ EchoServer: server.start()
+    Note over EchoServer: // 启动 sub-reactor 线程
+    loop for loop in subLoops_
+        Note over EchoServer,EventLoop: 启动线程执行后续，因此不影响该循环以及start()后续代码执行
+
+        EchoServer ->> EchoServer: threads_.emplace_back([&loop]() { loop->loop()#59; });
+        EchoServer ->>+ EventLoop: EventLoop::loop()
+        create participant SubThread@{ "type": "control" }
+        EventLoop ->> SubThread: 创建出 SubThread 子线程
+        SubThread -->> EventLoop: 执行依旧在 SubThread 子线程，这里只是说明在类中函数的执行过程
+
+        rect rgba(150, 255, 110, .4)
+        loop while(!quit_)
+            Note over EventLoop: subLoop 子线程在此处阻塞等待（三个子线程均在等待）
+            EventLoop ->> EventLoop: epoll_wait(epollFd_, events.data(), events.size(), -1);
+            Note over EventLoop: epoll_wait阻塞:<br>⬇ 什么都不发生，就一直睡着等 wakeupFd_ 可读<br> ⬇ 直到有人调queueInLoop → 写wakeupFd_ → epoll_wait返回
+            EventLoop -->>- EchoServer: 正常退出: quit_为true<br>错误退出: epoll_wait返回-1且不是EINTR
+            Note over EventLoop,EchoServer: sub-loop的loop()<br>返回→lambda结束→线程终止
+            Note over EventLoop,EchoServer: mainLoop的loop()<br>返回→start()返回→main()返回，程序结束
+            Note over EventLoop,EchoServer: 正常运行时<br>都不会返回，阻塞epoll_wait，只能信号杀进程
+        end
+        end
+    end
+
+    EchoServer ->>+ Acceptor: acceptor_->listen();
+        Note over Acceptor: ::listen(listenFd_, SOMAXCONN);
+        Acceptor ->>+ Channel: acceptChannel_->enableReading();
+            Note over Channel: // 设置或清除events_的(EPOLLIN|EPOLLET)
+            Channel ->>+ EventLoop: loop_->updateChannel(this);
+                Note over EventLoop: // 构造 epoll_event<br>ev.events = ch->events()  // 如 EPOLLIN|EPOLLET<br>ev.data.fd = ch->fd()
+                alt fd 不在 channels_ 中（新Channel）
+                    Note over EventLoop: epoll_ctl(epollFd_, EPOLL_CTL_ADD, ch->fd(), &ev)
+                else fd 已在 channels_ 中（已注册过）
+                    Note over EventLoop: epoll_ctl(epollFd_, EPOLL_CTL_MOD, ch->fd(), &ev)
+                end
+                Note over EventLoop: // 记录 fd → Channel 映射<br>channels_[ch->fd()] = ch<br>// 之后 epoll_wait 返回时靠它找到回调
+            EventLoop -->>- Channel: [nul]
+        Channel -->>- Acceptor: [nul]
+    Acceptor -->>- EchoServer: [nul]
+
+    Note over EchoServer: "EchoServer started on port, [N] sub-reactors"
+
+    Note over EchoServer: // main-reactor 在当前线程运行
+    EchoServer ->>+ EventLoop: mainLoop_->loop()
+    create participant MainThread@{ "type": "control" }
+    EventLoop ->> MainThread: 在 MainThread 主线程
+    MainThread -->> EventLoop: 执行依旧在 MainThread 主线程，这里只是说明在类中函数的执行过程
+    rect rgba(150, 255, 110, .4)
+        loop while(!quit_)
+        Note over EventLoop: mainLoop 主线程在此处阻塞等待
+        EventLoop ->> EventLoop: epoll_wait;
+        end
+    end
+
+    Note over main,MainThread: 程序完全准备就绪
+
+    Note over User: 运行 nc localhost 8888
+    User ->> MainThread: nc localhost 8888
+    MainThread ->> MainThread: epoll_wait 被唤醒<br>{events 内核会把本次检测到的已就绪事件填到这个数组里}
+    opt n<0
+    alt errno == EINTR
+        Note over MainThread: MainThread 主线程继续循环在 epoll_wait 阻塞
+        MainThread ->> MainThread: while(!quit_) epoll_wait();
+    else other
+        Note over MainThread: 真错误，退出
+    end
+    end
+
+    loop for ev in events
+    Note over MainThread: 遍历 events 找到 listenFd
+    alt fd == wakeupfd_
+        Note over MainThread: 处理 wakeupfd_ 可读事件
+        Note over MainThread: wakeupFd_ 分支只在有人跨线程写 eventfd 时才走，当前设计不会走
+        Note over MainThread: // 读取 eventfd 清除可读状态
+        MainThread ->> MainThread: handlePendingTasks();
+    else other
+        Note over MainThread: channels_.find(listenFd_) → 找到 acceptChannel
+        Note over MainThread: it->second->handleEvent(ev.events)
+        MainThread ->> Channel: Channel::handleEvent(ev.events{EPOLLIN})
+        Note over Channel: readCb_()
+        Channel ->> Acceptor: Acceptor::handleRead()
+        loop while(true)
+            Note over Acceptor: // ET 模式下循环 accept 直到 EAGAIN
+            Note over Acceptor: // 非阻塞模式<br>connFd = ::accept4(listenFd_, ..., ..., SOCK_NONBLOCK);
+            opt connFd < 0
+                alt errno==EAGAIN | EWOULDBLOCK
+                    Note over Acceptor: ET模式下没有更多链接了（已读完），break 跳出循环
+                else errno==EINTR
+                    Note over Acceptor: 被打断，continue 重试
+                else other
+                    Note over Acceptor: 真正错误，报错+break退出
+                end
+            end
+            Note over Acceptor: newConnCb_(connFd);
+            Acceptor ->> EchoServer: EchoServer::onNewConnection(connFd)
+            Note over EchoServer: // Round-Robin 轮询分配 sub-reactor<br>auto& sub = subLoops_[nextSub_]<br>nextSub_ = (nextSub_ + 1) % static_cast<int>(subLoops_.size());
+            Note over EchoServer: sub->runInLoop([this, fd{connFd}, sub{sub.get()}]() {...})
+            EchoServer ->> MainThread: EventLoop::runInLoop(...)
+
+            rect rgba(100, 255, 220, 0.3)
+            Note over MainThread: // threadId_都保存的主线程id，因此这里还在主线程中 get_id() == threadId_<br>// 因为传递的lambda所以还在这里执行，此处返回是假返回
+            MainThread -->>+ EchoServer: fn()
+                Note over EchoServer: // 创建 TcpConnection 的 unique_ptr 对象: conn<br>conn->fd = fd{connFd}<br>conn->loop = sub<br>conn->channel = new Channel(sub, fd{connFd})<br>// 这里创建出的 Channel 对象中的 loop_ 是 subLoop
+                Note over EchoServer: rawConn = conn.get() // 获取原始指针
+                Note over EchoServer: conn->channel->setReadCallback([this, rawConn]() { handleRead(rawConn)#59; })
+                EchoServer -->> Channel: setReadCallback(EventCallback cb)
+                Note over Channel: readCb_ = std::move(cb{EchoServer::handleRead(rawConn)})
+                Note over EchoServer: conn->channel->setCloseCallback([this, rawConn]() { removeConnection(rawConn)#59; })
+                EchoServer -->> Channel: setCloseCallback(EventCallback cb)
+                Note over Channel: closeCb_ = std::move(cb{EchoServer::removeConnection(rawConn)})
+                Note over EchoServer: // 注册到 epoll，监听 EPOLLIN | EPOLLET（边缘触发）<br>conn->channel->enableReading();
+                EchoServer -->>+ Channel: Channel::enableReading(bool on)
+                    Note over Channel: // 设置或清除events_的(EPOLLIN|EPOLLET)
+                    Channel -->>+ MainThread: loop_->updateChannel(this)#59; // loop_ 是 sub-reactor 的
+                        rect rgba(150, 0, 255, 0.5)
+                        Note over MainThread: 将新连接注册到 sub-reactor 的 epoll 上
+                        Note over MainThread: // 构造 epoll_event<br>ev.events = ch->events()<br>// 该 fd 就是 main-reactor 的 Acceptor 中 accept4 新收的连接<br>ev.data.fd = ch->fd()
+                        alt fd 不在 channels_ 中（新Channel）
+                            Note over MainThread: epoll_ctl(epollFd_, EPOLL_CTL_ADD, ch->fd(), &ev)
+                        else fd 已在 channels_ 中（已注册过）
+                            Note over MainThread: epoll_ctl(epollFd_, EPOLL_CTL_MOD, ch->fd(), &ev)
+                        end
+                        Note over MainThread: // 记录 fd → Channel 映射(操作的是 sub-reactor 的 channels_)<br>channels_[ch->fd()] = ch<br>// 之后 epoll_wait 返回时靠它找到回调
+                        end
+                    MainThread -->>- Channel: [nul]
+                Channel -->>- EchoServer: [nul]
+                Note over EchoServer: // 加锁 connMtx_（离开{}定义域自定析构解锁）<br>connections_[fd] = std::move(conn);
+            EchoServer -->>- MainThread: [nul]
+            end
+        end
+    end
+    end
+    MainThread ->> MainThread: epoll_wait 继续阻塞等待被唤醒 (main-reactor)
+
+    Note over User,MainThread: 连接已建立，main-reactor 已将新连接注册给 sub-reactor 的 epoll，等待已注册 fd 的数据来唤醒 sub-reactor 的 epoll_wait
+
+    Note over User: 输入 "hello", 发送数据
+    User ->>+ SubThread: send "hello"
+    SubThread ->> SubThread: epoll_wait() 被唤醒
+    opt n<0
+    alt errno == EINTR
+        Note over SubThread: SubThread 子线程继续循环在 epoll_wait 阻塞
+        SubThread ->> SubThread: while(!quit_) epoll_wait();
+    else other
+        Note over SubThread: 真错误，退出
+    end
+    end
+
+    loop for ev in events
+    Note over SubThread: 遍历 events 找到 connFd
+    alt fd == wakeupfd_
+        Note over SubThread: 处理 wakeupfd_ 可读事件
+        Note over SubThread: 当前设计下不会走到
+        SubThread ->> SubThread: handlePendingTasks();
+    else other
+        Note over SubThread: channels_.find(connFd) → 找到 conn 的 Channel
+        Note over SubThread: it->second->handleEvent(ev.events)
+        SubThread ->> Channel: Channel::handleEvent(ev.events{EPOLLIN})
+        Note over Channel: readCb_()
+        Channel ->> EchoServer: EchoServer::handleRead(rawConn)
+        Note over EchoServer: // ET 模式：循环读取直到 EAGAIN
+        Note over EchoServer: conn{rawConn} 来自 onNewConnection 中 conn<br>→ 取原始指针 → lambda 捕获传入此函数
+        loop while(true)
+            Note over EchoServer: n = ::recv(conn->fd, conn->buf, ...)
+            alt n > 0
+                Note over EchoServer: // 读到数据，原样回显<br>::send(conn->fd, conn->buf, n, 0)
+                EchoServer ->> User: send "[buf]"
+                Note over User: 回显 "hello"
+            else n == 0
+                Note over EchoServer: 对端关闭连接，break 退出循环
+            else n < 0
+                alt errno == EAGAIN | EWOULDBLOCK
+                    Note over EchoServer: 非错误，此为 ET 模式已读完的标志，break 退出循环
+                else errno == EINTR
+                    Note over EchoServer: 被信号中断，continue 重试
+                else other
+                    Note over EchoServer: 真正错误，break 退出循环
+                end
+            end
+        end
+    end
+    end
+    SubThread ->> SubThread: epoll_wait 继续阻塞等待被唤醒 (sub-reactor)
+    SubThread -->>- User: [nul]
+    Note over User,SubThread: 数据传输完成，后续是客户端关闭过程
+
+    Note over User: 关闭连接
+    User ->>+ SubThread: close connection, TCP FIN
+        SubThread ->> SubThread: epoll_wait 被唤醒
+        Note over SubThread: events 包含 connFd，EPOLLRDHUP（通常也有 EPOLLIN）
+        Note over SubThread: channels_.find(connFd) → 找到 conn 的 Channel
+        Note over SubThread: it->second->handleEvent(ev.events)
+        SubThread ->> Channel: Channel::handleEvent(ev.events{EPOLLRDHUP})
+        Note over Channel: closeCb_()
+        Channel ->> EchoServer: EchoServer::removeConnection(rawConn)
+        rect rgba(100, 255, 220, 0.3)
+        Note over EchoServer: // 在所属 sub-reactor 线程中安全移除
+        EchoServer -->>+ SubThread: conn->loop->runInLoop([this, fd{conn->fd}]() {...})
+            Note over EchoServer: // 加锁 connMtx_（离开{}作用域后自动解锁）
+            Note over EchoServer: it = connections_.find(fd)#59; // 根据 fd 查找连接
+            Note over EchoServer: it->second->loop->removeChannel(it->second->channel);
+            EchoServer -->>+ SubThread: EventLoop::removeChannel(Channel* ch)
+                Note over SubThread: // 删除监听 fd 连接<br>epoll_ctl(epollFd_, EPOLL_CTL_DEL, ch->fd(), nullptr);
+                Note over SubThread: // 删除 map channels_ 中的 [fd, Channel] 对<br>channels_.erase(ch->fd());
+            SubThread -->>- EchoServer: [nul]
+            Note over EchoServer: // 释放 Channel<br>delete it->second->channel;
+            Note over EchoServer: // 关闭 fd<br>::close(it->second->fd);
+            Note over EchoServer: // 删除 map connections_ 中的 [fd, TcpConnection] 对<br>connections_.erase(it);
+        SubThread -->>- EchoServer: [nul]
+        end
+        EchoServer -->> Channel: [nul]
+        Channel -->> SubThread: [nul]
+    SubThread -->>- User: [nul]
+
+    rect rgba(255, 100, 100, 0.8)
+    Note over EventLoop: 只有 Ctrl+C 才会往下开始结束整个程序
+    Note over main: signalHandler(SIGINT)
+        main ->>+ EchoServer: EchoServer::stop()
+        EchoServer ->>+ MainThread: EventLoop::quit()
+            Note over MainThread: quit_ = true;
+            MainThread ->> MainThread: wakeup();
+            Note over MainThread: ::write(wakeupFd_) // mainLoop 唤醒 epoll_wait
+        MainThread -->>- EchoServer: [nul]
+        EchoServer -->>- main: [nul]
+
+        MainThread ->> MainThread: epoll_wait 被唤醒
+        loop for ev in events
+            Note over MainThread: ev.data.fd == wakeupFd_
+            MainThread ->> MainThread: handlePendingTasks();
+            Note over MainThread: 创建局部空 queue tasks
+            Note over MainThread: 加锁 lock(mtx_)
+            Note over MainThread: std::swap(tasks, pendingTasks_)
+            Note over MainThread: 解锁（lock_guard 出作用域）
+            loop while(!tasks.empty())
+                Note over MainThread: // tasks.front() 取出队首任务，再加()来执行<br>tasks.front()()
+                Note over MainThread: tasks.pop()
+            end
+        end
+        Note over MainThread: quit_已修改为 true，EventLoop::loop() 中 while(!quit_) 退出循环
+        MainThread -->> EchoServer: 返回 EchoServer::start() 中
+        EchoServer -->>- main: start()返回，回到 main() 中
+    Note over main: server 离开作用域，触发析构 ~EchoServer()
+        main ->>+ EchoServer: EchoServer::~EchoServer()
+            Note over EchoServer: // 清理仍活跃的连接
+            Note over EchoServer: // 退出所有 sub-reactor 并 join 线程
+            loop for loop in subLoops_
+                Note over EchoServer: 执行 sub-reactor 的 quit() 函数
+                EchoServer ->>+ MainThread: EventLoop::quit()
+                Note over MainThread: quit_ = true;
+                MainThread ->> MainThread: wakeup();
+                Note over MainThread: ::write(wakeupFd_) // subLoop 唤醒 epoll_wait
+                MainThread -->> SubThread: [无实际流向]
+                SubThread ->> SubThread: epoll_wait 被唤醒
+                Note over SubThread: 此处处理过程同 MainThread 前面的处理一样
+                MainThread -->>- EchoServer: 触发 SubThread 即返回
+            end
+            loop for t in threads_
+                Note over EchoServer: 等待子线程执行完毕，join 汇聚所有子线程于此
+            end
+        EchoServer -->>- main: 析构完成
+    Note over main: [程序结束]
+    end
+
+
