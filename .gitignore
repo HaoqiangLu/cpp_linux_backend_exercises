@@ -37,3 +37,6 @@ Thumbs.db
 
 # ===== 临时目录（不上传） =====
 tmp/
+
+# ===== Redis 持久化数据（Docker 挂载目录） =====
+code/stage07/7-3-redis/data/

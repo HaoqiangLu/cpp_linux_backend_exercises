@@ -11,6 +11,7 @@
 | v1.0 | 2026-09-26 | 初版：阶段一至阶段四学习内容（无代码精简版），新增修订记录与配套代码说明 | 阿米亚波 |
 | v1.1 | 2026-10-01 | 补充阶段五：Linux 系统编程进阶（无代码精简版） | 阿米亚波 |
 | v1.2 | 2026-10-04 | 补充阶段六：网络编程进阶（无代码精简版） | 阿米亚波 |
+| v1.3 | 2026-10-06 | 补充阶段七：数据库、缓存与 HTTP（无代码精简版） | 阿米亚波 |
 
 ---
 
@@ -620,6 +621,121 @@
     - [ ] 能说出 Redis、Nginx、Netty 分别使用哪种 Reactor 模型。
       > **知识讲解**：**Redis——单线程 Reactor**：主线程用 epoll 监听所有事件（accept + 读写 + 定时器），命令在同一线程串行执行。成立前提是命令为**纯内存操作、耗时极短**，单线程反而避免锁竞争并天然保证原子性；代价是慢命令（大 key `DEL`）会阻塞整个实例，需 `UNLINK`/lazyfree 异步化。**Nginx——多进程 each-reactor**：master 不处理连接，每个 worker 进程持有独立的单线程 Reactor（accept + read + write + 业务同线程），通过 `SO_REUSEPORT`（或共享监听 fd + `accept_mutex`）分担新连接，worker 数 = CPU 核数，进程隔离无锁竞争。**Netty——主从多线程 Reactor**：boss 线程组（main-reactor）只负责 accept，把连接注册到 worker 线程组（sub-reactor）的某个 EventLoop，该连接的读写由固定线程处理，耗时业务再提交给独立**业务线程池**，实现 IO 与业务分离（即练习任务 4 的架构）。一句话对比：Redis 是“1 个 Reactor 干所有事”，Nginx 是“N 个互不相干的进程级 Reactor”，Netty 是“1 main + N sub + 业务线程池”。
     - [ ] 能解释 io_uring 相比 epoll 的优势（真正的异步、批量提交、共享环形缓冲区）。
-      > **知识讲解**：io_uring（Linux 5.1 引入）从三个层面突破 epoll 的上限。**① 真正的异步**：epoll 本质是“就绪通知”——`epoll_wait` 只告诉你“fd 可以读了”，数据搬运仍需自己调 `read`/`write`；io_uring 提交 SQE（如 `IORING_OP_READ`）后，内核把数据**直接搬运到你指定的缓冲区**并通过 CQE 通知完成，应用拿到的就是结果数据本身。**② 批量提交/收割**：SQE（提交队列）/CQE（完成队列）放在**用户态与内核态共享（mmap）的环形缓冲区**里，一次 `io_uring_submit` 可提交多个操作，收割 CQE 甚至可**零系统调用**（内核直接写入 CQ 环，应用轮询即可），把系统调用次数从 O(操作数) 降为接近 O(1)。**③ 附带收益**：支持超时、链式依赖（`IOSQE_IO_LINK`）、零拷贝发送（`SEND_ZC`）、注册固定缓冲区/fd。代价：接口比 epoll 复杂得多，且部分内核版本有安全漏洞历史；高吞吐存储引擎、代理网关是典型受益者，工程上建议用 liburing 库而非裸 syscall。
+      > **知识讲解**：io_uring（Linux 5.1 引入）从三个层面突破 epoll 的上限。**① 真正的异步**：epoll 本质是"就绪通知"——`epoll_wait` 只告诉你"fd 可以读了"，数据搬运仍需自己调 `read`/`write`；io_uring 提交 SQE（如 `IORING_OP_READ`）后，内核把数据**直接搬运到你指定的缓冲区**并通过 CQE 通知完成，应用拿到的就是结果数据本身。**② 批量提交/收割**：SQE（提交队列）/CQE（完成队列）放在**用户态与内核态共享（mmap）的环形缓冲区**里，一次 `io_uring_submit` 可提交多个操作，收割 CQE 甚至可**零系统调用**（内核直接写入 CQ 环，应用轮询即可），把系统调用次数从 O(操作数) 降为接近 O(1)。**③ 附带收益**：支持超时、链式依赖（`IOSQE_IO_LINK`）、零拷贝发送（`SEND_ZC`）、注册固定缓冲区/fd。代价：接口比 epoll 复杂得多，且部分内核版本有安全漏洞历史；高吞吐存储引擎、代理网关是典型受益者，工程上建议用 liburing 库而非裸 syscall。
+
+---
+
+# 阶段七：数据库、缓存与 HTTP
+
+> **定位**：综合项目的前置知识——为项目补齐数据存储（MySQL）、缓存加速（Redis）与 Web 协议解析（HTTP）三大能力。
+
+## 7.1 MySQL 基础与 C++ 接入
+
+- **练习目标**：
+    - 理解关系型数据库的基本概念：表、行、列、主键、索引、事务。
+    - 掌握 SQL 基础：SELECT / INSERT / UPDATE / DELETE、JOIN、GROUP BY、索引。
+    - 掌握 C++ 接入 MySQL 的方式：MySQL Connector/C++ 或 libmariadbclient。
+    - 理解预处理语句（Prepared Statement）的作用：防 SQL 注入、提升批量性能。
+- **练习任务**：
+    1. 设计一张"用户表"（id / username / password_hash / created_at），建表并加索引。
+    2. 用 C++ 实现用户注册：插入一条记录，密码用 bcrypt 哈希存储。
+    3. 用预处理语句实现用户登录：按 username 查询，比对密码哈希。
+    4. 实现一个"用户信息 CRUD"类，封装所有 SQL 操作，使用 RAII 管理连接与 statement。
+    5. 演示 SQL 注入场景（拼接字符串 vs 预处理），理解为什么必须用预处理。
+- **巩固标准**：
+    - [ ] 能解释主键、唯一索引、普通索引的区别与适用场景。
+    > **知识讲解**：主键（PRIMARY KEY）是唯一标识一行数据的列，自动创建聚簇索引（InnoDB 中数据按主键顺序物理存储），隐含 NOT NULL + UNIQUE 约束，每张表只能有一个。唯一索引（UNIQUE INDEX）保证列值不重复，允许 NULL（NULL 不参与唯一性检查），适合 username、email 等业务唯一字段，一张表可有多个。普通索引（INDEX）仅加速查询，不施加任何约束，适合高频 WHERE 条件列（如 created_at、status）。选择原则：**必须唯一标识行 → 主键；业务要求不重复 → 唯一索引；纯粹为了查询加速 → 普通索引**。注意索引并非越多越好——每个索引都会增加 INSERT/UPDATE/DELETE 的开销（需同步维护索引树），且占用额外磁盘空间，通常一张表 3~5 个索引为宜。
+    - [ ] 能说出预处理语句为什么能防 SQL 注入（参数与 SQL 分离）。
+    > **知识讲解**：SQL 注入的本质是用户输入被当作 SQL 语法解析——例如拼接 `"WHERE username = '" + input + "'"`，当 input 为 `' OR '1'='1` 时，SQL 变为 `WHERE username = '' OR '1'='1'`，恒真条件返回全部行。预处理语句（Prepared Statement）通过**两阶段执行**从根本上杜绝此问题：① 先发送 SQL 模板 `SELECT * FROM users WHERE username = ?` 给服务器，服务器完成语法解析、生成执行计划；② 再单独发送参数值，参数被严格当作纯数据处理，不会被重新解析为 SQL 语法。无论参数内容是什么（引号、分号、注释符），都只影响数据比较结果，不可能改变 SQL 结构。此外预处理语句还有性能优势：同一模板多次执行时，服务器复用已编译的执行计划，省去重复解析开销，批量插入场景尤为明显。
+    - [ ] 能用 EXPLAIN 分析一条 SQL 的执行计划，判断是否命中索引。
+    > **知识讲解**：`EXPLAIN SELECT ...` 在 SQL 前加 EXPLAIN 关键字即可让 MySQL 返回执行计划而不真正执行查询。MySQL 26.x 默认输出树形简略格式（如 `-> Rows fetched before execution (cost=0..0 rows=1)`），适合日常快速查看；加 `EXPLAIN FORMAT=TRADITIONAL` 可切换为传统表格格式，适合深度调优。传统表格核心关注以下列：**type**（访问类型，从优到劣依次为 system > const > eq_ref > ref > range > index > ALL，ALL 即全表扫描应避免）、**key**（实际使用的索引名，NULL 表示未命中索引）、**rows**（预估扫描行数，越小越好）、**Extra**（附加信息，`Using index` 表示覆盖索引最优，`Using where` 表示回表过滤，`Using filesort` / `Using temporary` 表示需要额外排序或临时表，应优化）。以本项目为例：`EXPLAIN FORMAT=TRADITIONAL SELECT * FROM users WHERE username = 'alice'` 应显示 type=const、key=username，说明命中了唯一索引；若去掉索引则 type=ALL、key=NULL，全表扫描。养成"写复杂查询前先 EXPLAIN"的习惯，是数据库性能调优的基本功。
+
+## 7.2 连接池与事务
+
+- **练习目标**：
+    - 理解为什么需要连接池（避免频繁建连开销）。
+    - 实现一个简单的 MySQL 连接池（基于 `std::queue` + `std::mutex` + `std::condition_variable`）。
+    - 理解事务的 ACID 特性与四种隔离级别（读未提交 / 读已提交 / 可重复读 / 串行化）。
+    - 掌握 C++ 中的事务封装（BEGIN / COMMIT / ROLLBACK）。
+- **练习任务**：
+    1. 实现一个连接池类：`acquire()` 获取连接、`release()` 归还、支持最大连接数限制与超时。
+    2. 用连接池压测：100 个线程并发执行 1000 次查询，对比"每次新建连接"与"使用连接池"的耗时。
+    3. 实现一个"转账"事务：A 减 100、B 加 100，模拟中途失败回滚。
+    4. 演示"脏读 / 不可重复读 / 幻读"场景，切换隔离级别观察变化。
+- **巩固标准**：
+    - [ ] 能画出连接池的获取 / 归还 / 扩容流程。
+    > **知识讲解**：连接池的核心数据结构是 `std::queue<MYSQL*>` + `std::mutex` + `std::condition_variable`。**获取流程**（acquire）：加锁 → 若队列为空且当前连接数未达 `maxConn_`，则 `mysql_init` + `mysql_real_connect` 新建连接并返回（扩容）；若队列空且已达上限，则 `cv.wait(lock, pred, timeout)` 阻塞等待，超时返回 `nullptr`；若队列非空则 `pop` 取出连接返回。**归还流程**（release）：加锁 → `push` 连接回队列 → `cv.notify_one()` 唤醒一个等待线程。**扩容策略**：通常在构造时预创建 `minConn_` 个连接（预热），按需增长直到 `maxConn_`；也有实现采用 LIFO 栈（`std::stack`）代替 FIFO 队列，使最近使用过的连接优先被复用，利用 CPU 缓存局部性提升性能。关键不变量：**任意时刻，池中连接数 + 被借出连接数 = 已创建总连接数 ≤ maxConn_**。
+    - [ ] 能解释四种隔离级别分别解决了什么问题、引入了什么开销。
+    > **知识讲解**：并发事务带来的三类问题是递进关系——**脏读**（读到别的事务未提交的中间状态，对方回滚后数据即"脏"）→ **不可重复读**（同一事务内两次 SELECT 结果不同，因为别的事务在此期间 COMMIT 了）→ **幻读**（两次范围查询结果行数不同，因为别的事务 INSERT/DELETE 了新行）。四种隔离级别从低到高：**READ UNCOMMITTED**（读未提交）几乎无额外开销，但允许脏读，生产环境极少使用；**READ COMMITTED**（读已提交）通过行级锁保证每次 SELECT 只读到已提交数据，解决脏读，但同一事务内两次查询可能结果不同（不可重复读），Oracle 默认级别；**REPEATABLE READ**（可重复读）是 MySQL 默认级别，通过 MVCC（多版本并发控制）快照读保证同一事务内多次 SELECT 结果一致，解决不可重复读，InnoDB 还配合 Gap Lock（间隙锁）在索引范围上加锁阻止其他事务插入新行，从而大幅减少幻读，但 Gap Lock 会锁定索引范围导致并发写入性能下降；**SERIALIZABLE**（串行化）强制所有事务串行执行，彻底解决三类问题，但并发性能最差。工程权衡：绝大多数业务使用默认的 REPEATABLE READ 即可，只有金融对账等极端场景才需要 SERIALIZABLE，而高并发读多写少场景可降级到 READ COMMITTED 换取吞吐量。
+    - [ ] 能说出"连接必须归还"的 RAII 封装方式（`std::shared_ptr` + 自定义 deleter）。
+    > **知识讲解**：裸指针方式获取连接后若中途 `return` 或抛异常，极易忘记调用 `release()` 导致连接泄漏、池逐渐枯竭。RAII 封装方案：`acquire()` 返回 `std::shared_ptr<MYSQL>`，构造时传入自定义 deleter `[pool](MYSQL* conn) { pool->release(conn); }`，这样连接指针离开作用域时（无论是正常返回、提前 return 还是异常抛出），`shared_ptr` 析构自动调用 deleter 将连接归还池中，无需手动管理。示例：`auto conn = pool.acquire(); mysql_query(conn.get(), "SELECT ..."); // 函数结束 conn 自动归还`。为什么不选 `unique_ptr`？因为 `unique_ptr` 的 deleter 类型是模板参数，会在编译期实例化，导致头文件必须暴露 `ConnectionPool` 完整定义（否则无法实例化 deleter）；而 `shared_ptr` 的 deleter 是类型擦除的运行时多态，头文件只需前置声明即可，编译隔离性更好——这也是本练习框架中 `ConnPtr` 定义为 `std::shared_ptr<void>` 的原因。
+
+## 7.3 Redis 基础与 C++ 接入
+
+- **练习目标**：
+    - 理解 Redis 的数据结构：string / hash / list / set / zset，以及常见应用场景。
+    - 掌握 Redis 的持久化：RDB（快照）与 AOF（追加日志）。
+    - 掌握 C++ 接入 Redis 的方式：hiredis 或 redis-plus-plus。
+    - 理解 Redis 的常见应用：缓存、会话、限流、排行榜、分布式锁。
+- **练习任务**：
+    1. 用 redis-cli 练习五种基本数据结构的常用命令。
+    2. 用 redis-plus-plus 实现"用户会话"：登录后 set session_id → user_id，TTL 30 分钟。
+    3. 实现"接口限流"：用 INCR + EXPIRE 做滑动窗口计数。
+    4. 实现"排行榜"：用 zset 存用户分数，按分数排序取 top 10。
+    5. 配置 Redis 的 RDB + AOF 持久化，验证重启后数据恢复。
+- **巩固标准**：
+    - [ ] 能说出五种数据结构的典型应用场景（至少各 2 个）。
+    > **知识讲解**：**string**——缓存会话信息（session_id → user_id）、计数器（INCR 限流/点赞数）、分布式锁（SET key value NX EX）。**hash**——存储对象（用户信息 user:id → {name, age, email}）、购物车（cart:userId → {商品id: 数量}）。**list**——消息队列（LPUSH 生产 + BRPOP 消费）、最新动态（LPUSH + LRANGE 取最新 N 条）。**set**——标签系统（SADD 文章标签）、共同关注（SINTER 两个用户的关注集合交集）、去重（SISMEMBER 判断是否已读）。**zset（有序集合）**——排行榜（ZADD 分数 + ZREVRANGE 取 top N）、延迟队列（score 为执行时间戳）、带权重的任务调度。选择原则：简单 KV → string；结构化对象且需部分更新 → hash；有序列表/队列 → list；集合运算（交并差） → set；需要按分数排序 → zset。
+    - [ ] 能对比 RDB 与 AOF 的优缺点（恢复速度 vs 数据完整性）。
+    > **知识讲解**：**RDB（快照）**在指定条件触发时生成某一时刻的全量二进制快照（dump.rdb），优点是文件紧凑、恢复速度快（直接加载二进制到内存），适合备份和灾难恢复；缺点是两次快照之间的写入可能丢失（如 `save 60 1` 最多丢 60 秒数据），且 fork 子进程生成快照时大内存可能阻塞。**AOF（追加日志）**将每条写命令追加到日志文件（appendonly.aof），优点是可以配置 `appendfsync everysec`（每秒刷盘，最多丢 1 秒数据）或 `always`（每条刷盘，零丢失但最慢），数据完整性更高；缺点是文件比 RDB 大、恢复速度慢（需重放所有命令）。**工程实践**：生产环境通常 RDB + AOF 同时开启——AOF 保证数据安全，RDB 用于快速恢复和定期备份。Redis 7+ 采用 Multi-part AOF（base.rdb + incr.aof + manifest），结合了 RDB 的快速加载和 AOF 的增量记录，恢复时先加载 base.rdb 再重放 incr.aof，兼顾两者优势。
+    - [ ] 能解释 Redis 单线程为什么这么快（纯内存、IO 多路复用、高效数据结构）。
+    > **知识讲解**：Redis 核心命令处理采用单线程模型（Redis 6+ 引入多线程处理网络 IO，但命令执行仍是单线程），快的原因有三：① **纯内存操作**——所有数据在内存中，读写延迟纳秒级，无磁盘 IO 瓶颈，相比数据库（磁盘随机访问毫秒级）快 3~4 个数量级；② **IO 多路复用**——基于 epoll/kqueue 实现事件驱动，单线程同时监听成千上万个连接的读写事件，避免线程切换开销；③ **高效数据结构**——每种操作都针对底层数据结构优化，如 dict（哈希表）O(1) 查找、skiplist（跳表）O(logN) 范围查询、ziplist/listpack（压缩列表）小数据量下内存连续减少 cache miss、SDS（简单动态字符串）预分配减少内存重分配。此外单线程避免了多线程的锁竞争和上下文切换开销，命令执行是原子的，无需考虑并发一致性。
+
+## 7.4 缓存策略与一致性
+
+- **练习目标**：
+    - 掌握常见的缓存策略：Cache Aside、Read/Write Through、Write Behind。
+    - 理解缓存穿透、缓存击穿、缓存雪崩的成因与解决方案。
+    - 理解数据库与缓存一致性的挑战与常用方案（延迟双删、Binlog 订阅）。
+- **练习任务**：
+    1. 实现 Cache Aside 模式：先查缓存，未命中再查 DB，结果回填缓存。
+    2. 模拟"缓存穿透"：对不存在的 key 频繁查询，加"空值缓存 + 短 TTL"或布隆过滤器解决。
+    3. 模拟"缓存击穿"：热点 key 过期瞬间大量请求打到 DB，用互斥锁或永不过期 + 异步刷新解决。
+    4. 实现"延迟双删"：更新 DB 前删缓存、更新 DB 后延迟再删一次，验证一致性。
+- **巩固标准**：
+    - [ ] 能画出 Cache Aside 的读写流程。
+      > **知识讲解**：**Cache Aside（旁路缓存）** 是最常用的缓存策略，核心流程为——**读操作**：先查缓存，命中直接返回；未命中则查 DB，将结果回填缓存并设 TTL，下次请求直接命中缓存。**写操作**：先删缓存，再更新 DB（也可先更新 DB 再删缓存）。选择"先删缓存再更新 DB"的原因是：如果先更新 DB 再删缓存，在删缓存之前另一个线程读到旧缓存并回填，会导致缓存与 DB 不一致。Cache Aside 的优势是简单可靠，缓存只保存被访问过的数据（按需加载），不会浪费内存存冷数据；缺点是首次访问和缓存失效时会有"缓存穿透到 DB"的延迟。TTL 的选择需要权衡：太短则缓存命中率低、DB 压力大；太长则数据陈旧、一致性差。通常业务热点数据设 60~300 秒，配合业务更新时主动删除缓存来保证最终一致性。
+    - [ ] 能对比"缓存穿透 / 击穿 / 雪崩"三种问题的区别与各自解决方案。
+      > **知识讲解**：三者的区别在于**触发条件**和**影响范围**不同：
+      >
+      > | 问题 | 触发条件 | 影响范围 | 解决方案 |
+      > |------|----------|----------|----------|
+      > | **缓存穿透** | 查询**不存在**的 key，缓存和 DB 都无数据 | 每次请求都打到 DB | 空值缓存 + 短 TTL（5s）；布隆过滤器拦截 |
+      > | **缓存击穿** | **单个热点** key 过期瞬间，大量并发请求同时查 DB | 单个 key 对应的 DB 查询暴增 | 互斥锁（只允许一个线程查 DB 并回填）；热点 key 永不过期 + 异步刷新 |
+      > | **缓存雪崩** | **大量** key 同时过期，或 Redis 整体宕机 | 所有请求打到 DB，可能导致 DB 崩溃 | TTL 加随机偏移避免集中过期；多级缓存（本地缓存 + Redis）；限流降级 |
+      >
+      > **工程实践**：穿透用空值缓存最简单，但如果攻击者构造大量不存在的 key，空值缓存本身也会占满内存，此时布隆过滤器更合适（O(1) 判断 key 是否存在，误判率可控在 1% 以内，内存占用极小）。击穿用互斥锁时注意锁粒度——应该 per-key 而非全局锁，否则一个 key 的慢查询会阻塞所有其他 key 的访问。雪崩的根因是"集中过期"，给 TTL 加随机值（如 `base + rand(0, 60)`）就能大幅缓解。
+    - [ ] 能解释为什么"强一致性"在缓存场景很难做到，以及业务上如何取舍。
+      > **知识讲解**：缓存与 DB 的**强一致性**要求"任何时刻缓存和 DB 的数据完全相同"，但这在分布式系统中几乎不可能做到，原因有三：① **非原子操作**——删缓存和更新 DB 是两个独立操作，中间存在时间窗口，其他线程可能读到旧缓存或旧 DB； **并发竞争**——线程 A 删缓存 → 线程 B 读旧 DB 回填旧缓存 → 线程 A 更新 DB，最终缓存是旧值；③ **网络延迟**——缓存和 DB 可能是不同节点，同步存在延迟。**工程取舍**：大多数业务接受"最终一致性"——通过延迟双删（删缓存 → 更新 DB → sleep 200ms → 再删缓存）将不一致窗口从秒级压缩到毫秒级；更严格的场景用 Binlog 订阅（如 Canal）监听 DB 变更事件，异步删除/更新缓存，保证最终一致。对于读多写少的场景（如商品详情），Cache Aside + TTL 已经足够；对于写多读少或强一致性要求的场景（如金融余额），应该绕过缓存直接读 DB。
+
+## 7.5 HTTP 协议基础
+
+- **练习目标**：
+    - 理解 HTTP/1.1 的请求与响应格式：请求行、Header、Body。
+    - 掌握常见请求方法（GET / POST / PUT / DELETE / HEAD / OPTIONS）与状态码（200 / 301 / 304 / 400 / 403 / 404 / 500）。
+    - 理解 Header 语义：Content-Length / Transfer-Encoding: chunked / Connection: keep-alive / Host / User-Agent / Content-Type。
+    - 理解 URL 编码、MIME 类型。
+- **练习任务**：
+    1. 用 `curl -v` 观察一次完整 HTTP 请求的请求行、Header、响应。
+    2. 实现一个 HTTP 请求解析器：解析请求行、Header、Body（Content-Length 与 chunked 两种）。
+    3. 实现一个 HTTP 响应构造器：支持状态码、Header、Body、chunked 编码。
+    4. 实现 MIME 类型映射：根据文件后缀返回 Content-Type。
+- **巩固标准**：
+    - [ ] 能手绘 HTTP 请求与响应的报文结构。
+      > **知识讲解**：HTTP 是**无状态的请求-响应协议**，基于 TCP 传输。请求报文由三部分组成：① **请求行**——`<Method> <URI> <Version>\r\n`，如 `GET /index.html HTTP/1.1\r\n`；② **请求头**——每行 `<Key>: <Value>\r\n`，如 `Host: example.com`、`Content-Length: 256`，Header 结束于一个空行 `\r\n`；③ **请求体**（可选）——POST/PUT 方法携带的数据，长度由 Content-Length 指定或通过 `Transfer-Encoding: chunked` 分块传输。响应报文同样三部分：① **状态行**——`<Version> <StatusCode> <ReasonPhrase>\r\n`，如 `HTTP/1.1 200 OK\r\n`；② **响应头**——与请求头格式相同；③ **响应体**——服务器返回的数据（HTML、JSON、图片等）。常见状态码分五类：`1xx`（信息）、`2xx`（成功，200 OK、204 No Content）、`3xx`（重定向，301 永久、302 临时、304 Not Modified 用于缓存）、`4xx`（客户端错误，400 Bad Request、403 Forbidden、404 Not Found）、`5xx`（服务端错误，500 Internal Server Error、502 Bad Gateway、503 Service Unavailable）。
+    - [ ] 能解释 GET 与 POST 在语义、幂等性、缓存、请求体上的区别。
+      > **知识讲解**：GET 和 POST 的核心区别在于**语义**而非技术实现。GET 用于**获取资源**，语义上是**幂等**的（多次请求结果相同、无副作用），因此可被浏览器缓存、可收藏书签、可被 CDN 缓存；POST 用于**提交数据**，语义上**非幂等**（每次提交可能产生不同效果，如创建订单），默认不被缓存。技术层面的区别：① GET 将参数编码在 URL 中（`?key=value`），受 URL 长度限制（浏览器通常 2KB~8KB），POST 将数据放在请求体中，理论上无大小限制；② GET 请求是幂等的，重复发送不会产生副作用，POST 则可能重复提交（如重复下单）；③ GET 只支持 URL 编码（`application/x-www-form-urlencoded`），POST 支持多种 Content-Type（`multipart/form-data` 上传文件、`application/json` 等）。**工程实践**：RESTful API 中 GET 用于查询、POST 用于创建、PUT 用于更新、DELETE 用于删除，严格遵循语义而非技术差异。
+    - [ ] 能处理 chunked 编码的解码（读取 chunk size → 读取 chunk data → 直到 0 长度 chunk）。
+      > **知识讲解**：chunked 编码是 HTTP/1.1 引入的**分块传输机制**，用于服务器事先不知道响应体总大小的场景（如动态生成内容、流式输出）。格式为：每个 chunk 由**一行十六进制的 chunk size**（不含 `\r\n` 长度本身）+ `\r\n` + **chunk data**（恰好 size 字节）+ `\r\n` 组成；最后一个 chunk 的 size 为 `0`，表示传输结束，之后可能跟随 trailer headers（可选）。解码流程：① 读一行直到 `\r\n`，解析为十六进制整数 size；② 若 size == 0，解码结束；③ 读取 size 字节的数据；④ 读取 2 字节 `\r\n`（chunk 尾部分隔符）；⑤ 重复①。与 Content-Length 的对比：Content-Length 需要服务器提前计算总大小，适合静态文件；chunked 不需要预知大小，适合动态流式响应，但增加了 chunk 头尾的解析开销。**工程实践**：HTTP/2 已废弃 chunked 编码，改用帧（frame）机制传输数据，但 HTTP/1.1 场景仍需支持。
 
 ---

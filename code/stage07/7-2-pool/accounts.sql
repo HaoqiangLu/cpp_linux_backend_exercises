@@ -1,0 +1,8 @@
+USE testdb;
+
+CREATE TABLE IF NOT EXISTS accounts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  balance DOUBLE NOT NULL DEFAULT 0
+);
+
+INSERT INTO accounts (balance) VALUES (1000), (1000);
