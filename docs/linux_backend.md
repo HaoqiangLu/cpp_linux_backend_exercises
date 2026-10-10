@@ -6050,9 +6050,12 @@ int main() {
 // │   ├── HttpServer.h
 // │   ├── HttpRequest.h
 // │   ├── HttpResponse.h
+// │   ├── HttpHandler.h
 // │   ├── ThreadPool.h
 // │   ├── TimerQueue.h
-// │   └── Logger.h
+// │   ├── Logger.h
+// │   ├── Config.h
+// │   └── StaticFileSender.h
 // ├── src/
 // │   ├── EventLoop.cpp
 // │   ├── Channel.cpp
@@ -6061,9 +6064,12 @@ int main() {
 // │   ├── HttpServer.cpp
 // │   ├── HttpRequest.cpp
 // │   ├── HttpResponse.cpp
+// │   ├── HttpHandler.cpp
 // │   ├── ThreadPool.cpp
 // │   ├── TimerQueue.cpp
 // │   ├── Logger.cpp
+// │   ├── Config.cpp
+// │   ├── StaticFileSender.cpp
 // │   └── main.cpp
 // ├── conf/
 // │   └── server.conf
@@ -6077,12 +6083,14 @@ int main() {
 #pragma once
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <vector>
+#include <thread>
 
 class Channel;
+class TimerQueue;
 
 class EventLoop {
 public:
@@ -6094,15 +6102,21 @@ public:
     void removeChannel(Channel* ch);
     void runInLoop(std::function<void()> fn);
     void queueInLoop(std::function<void()> fn);
+    TimerQueue* timerQueue() { return timerQueue_.get(); }
+    bool isInLoopThread() const { return std::this_thread::get_id() == threadId_; }
 
 private:
     void wakeup();
     void handlePendingTasks();
+
     int epollFd_;
     int wakeupFd_;  // eventfd
     std::atomic<bool> quit_{false};
+    std::thread::id threadId_;  // 所属线程 ID
     std::mutex mtx_;
     std::queue<std::function<void()>> pendingTasks_;
+    std::map<int, Channel*> channels_;  // fd -> Channel
+    std::unique_ptr<TimerQueue> timerQueue_;
 };
 
 // ---------- include/Channel.h ----------
@@ -6111,6 +6125,7 @@ private:
 
 class EventLoop;
 
+// 封装 fd + 关注事件 + 回调
 class Channel {
 public:
     using EventCallback = std::function<void()>;
@@ -6121,11 +6136,14 @@ public:
     void setErrorCallback(EventCallback cb)  { errorCb_ = std::move(cb); }
     void enableReading(bool on = true);
     void enableWriting(bool on = true);
-    void handleEvent(int revents);
+    void handleEvent(int revents);  // 由 EventLoop 调用
     int fd() const { return fd_; }
+    int events() const { return events_; }
+
 private:
     EventLoop* loop_;
     int fd_;
+    int events_{0};  // 当前关注的 epoll 事件掩码
     EventCallback readCb_, writeCb_, closeCb_, errorCb_;
 };
 
@@ -6140,8 +6158,10 @@ class Acceptor {
 public:
     using NewConnCallback = std::function<void(int fd)>;
     Acceptor(EventLoop* loop, int port);
+    ~Acceptor();
     void setNewConnCallback(NewConnCallback cb) { newConnCb_ = std::move(cb); }
     void listen();
+
 private:
     void handleRead();
     EventLoop* loop_;
@@ -6152,6 +6172,8 @@ private:
 
 // ---------- include/TcpConnection.h ----------
 #pragma once
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -6164,54 +6186,97 @@ public:
     ~TcpConnection();
     void send(const std::string& data);
     void shutdown();
+    int fd() const { return fd_; }
+    void touch() { lastActiveMs_ = nowMs(); }   // 刷新最后活动时间（空闲超时判定用）
+    int64_t lastActiveMs() const { return lastActiveMs_; }
+    void retrieveAllInput() { inputBuffer_.clear(); }
     void setConnectionCallback(std::function<void(const std::shared_ptr<TcpConnection>&)> cb);
     void setMessageCallback(std::function<void(const std::shared_ptr<TcpConnection>&, const std::string&)> cb);
     void setCloseCallback(std::function<void(const std::shared_ptr<TcpConnection>&)> cb);
 
 private:
+    static int64_t nowMs();
     void handleRead();
     void handleWrite();
     void handleClose();
+    void sendInLoop(const std::string& data);   // 仅在 IO 线程执行的实际写逻辑
+    void shutdownInLoop();                       // 仅在 IO 线程执行的实际半关闭逻辑
+
     EventLoop* loop_;
     Channel* channel_;
     int fd_;
+    int64_t lastActiveMs_{0};   // 最后一次收到数据的时间，仅在归属 IO 线程读写
     std::string inputBuffer_;
     std::string outputBuffer_;
+    std::function<void(const std::shared_ptr<TcpConnection>&)> connCb_;
+    std::function<void(const std::shared_ptr<TcpConnection>&, const std::string&)> msgCb_;
+    std::function<void(const std::shared_ptr<TcpConnection>&)> closeCb_;
 };
 
 // ---------- include/HttpServer.h ----------
 #pragma once
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 class EventLoop;
 class Acceptor;
+class TcpConnection;
+class ThreadPool;
 
 class HttpServer {
 public:
     HttpServer(int port, int subReactorCount = 3, int threadPoolSize = 4);
+    ~HttpServer();
     void start();
+    void stop();
     void setDocumentRoot(const std::string& root) { docRoot_ = root; }
+    void setConnectionTimeoutMs(int64_t timeoutMs) { connTimeoutMs_ = timeoutMs; }
+    void setStaticFileStrategy(const std::string& s) { staticStrategy_ = s; }
 
 private:
     void onNewConnection(int fd);
     void onRequest(const std::shared_ptr<TcpConnection>& conn, const std::string& msg);
+    void onClose(const std::shared_ptr<TcpConnection>& conn);
+    // 空闲超时：挂载自校验定时器（捕获 weak_ptr + 身份校验），
+    // 避免陈旧定时器误删后来复用同一 fd 的新连接（旧实现的崩溃根因）
+    void scheduleIdleClose(EventLoop* loop, int fd, std::weak_ptr<TcpConnection> weak, int64_t delayMs);
 
     int port_;
     std::string docRoot_{"./www"};
-    EventLoop mainLoop_;
+    std::string staticStrategy_{"readwrite"};   // 静态文件发送策略: readwrite | mmap
+    int64_t connTimeoutMs_{30 * 1000};          // 连接空闲超时，可由配置注入
+    std::unique_ptr<EventLoop> mainLoop_;
     std::unique_ptr<Acceptor> acceptor_;
     std::vector<std::unique_ptr<EventLoop>> subLoops_;
-    int nextSub_{0};
+    std::vector<std::thread> subThreads_;
+    std::unique_ptr<ThreadPool> threadPool_;
+    std::atomic<int> nextSub_{0};
+
+    std::mutex connMtx_;
+    std::unordered_map<int, std::shared_ptr<TcpConnection>> connections_;
 };
 
 // ---------- src/main.cpp ----------
 #include "HttpServer.h"
+#include "Config.h"
+#include "Logger.h"
 
 int main() {
-    HttpServer server(8080, 3, 4);
-    server.setDocumentRoot("./www");
+    // TODO: Config cfg; cfg.load("./conf/server.conf")
+    // TODO: 从配置读取 port、sub_reactor_count、thread_pool_size、docRoot、
+    //       logPath、log_level、connection_timeout_ms、static_file_strategy
+    // TODO: 依据 log_level 调 Logger::instance().setLevel(...)，log_path 非空则 setOutput(...)
+    HttpServer server(port, subReactorCount, threadPoolSize);
+    server.setDocumentRoot(docRoot);
+    server.setConnectionTimeoutMs(connTimeoutMs);          // 注入空闲超时
+    server.setStaticFileStrategy(staticStrategy);          // readwrite | mmap（8.6 压测对比）
     server.start();
+    // TODO: LOG_INFO("HttpServer exited cleanly")
     return 0;
 }
 ```
@@ -6251,24 +6316,36 @@ int main() {
 // ---------- src/EventLoop.cpp ----------
 #include "EventLoop.h"
 #include "Channel.h"
+#include "TimerQueue.h"
+#include <array>
+#include <cstdlib>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <utility>
 
-EventLoop::EventLoop() {
+EventLoop::EventLoop() : threadId_(std::this_thread::get_id()) {
     // TODO: epollFd_ = epoll_create1(EPOLL_CLOEXEC)
+    // TODO: 若 epollFd_ < 0，perror 并 exit
     // TODO: wakeupFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)
-    // TODO: 把 wakeupFd_ 加入 epoll 监听 EPOLLIN
+    // TODO: 若 wakeupFd_ < 0，perror 并 exit
+    // TODO: 将 wakeupFd_ 加入 epoll 监听 EPOLLIN
+    // TODO: timerQueue_ = std::make_unique<TimerQueue>()
 }
 
 EventLoop::~EventLoop() {
-    // TODO: close(epollFd_); close(wakeupFd_)
+    // TODO: epoll_ctl DEL wakeupFd_
+    // TODO: close(wakeupFd_)
+    // TODO: close(epollFd_)
 }
 
 void EventLoop::loop() {
+    // TODO: std::array<struct epoll_event, 1024> events
     // TODO: while (!quit_) {
-    //   epoll_wait(epollFd_, events, max, timeout)
-    //   分发事件给 Channel::handleEvent
+    //   int timeout = timerQueue_->nextExpireMs()（计算 epoll_wait 超时，-1 表示无限等待）
+    //   epoll_wait(epollFd_, events.data(), events.size(), timeout)
+    //   分发事件：若 fd == wakeupFd_，读取清除状态；否则查找 channels_ 调用 handleEvent
+    //   timerQueue_->processExpiredTimers()
     //   handlePendingTasks()
     // }
 }
@@ -6278,27 +6355,34 @@ void EventLoop::quit() {
 }
 
 void EventLoop::updateChannel(Channel* ch) {
-    // TODO: epoll_ctl ADD 或 MOD
+    // TODO: struct epoll_event ev{}; ev.events = ch->events(); ev.data.fd = ch->fd()
+    // TODO: 若 channels_ 中不存在该 fd，epoll_ctl ADD；否则 epoll_ctl MOD
+    // TODO: channels_[ch->fd()] = ch
 }
 
 void EventLoop::removeChannel(Channel* ch) {
     // TODO: epoll_ctl DEL
+    // TODO: channels_.erase(ch->fd())
 }
 
 void EventLoop::runInLoop(std::function<void()> fn) {
-    // TODO: 若当前线程就是 EventLoop 线程，直接执行；否则 queueInLoop + wakeup
+    // TODO: if (isInLoopThread()) fn()
+    // TODO: else queueInLoop(std::move(fn))
 }
 
 void EventLoop::queueInLoop(std::function<void()> fn) {
-    // TODO: 加锁 push 到 pendingTasks_，wakeup
+    // TODO: { std::lock_guard lock(mtx_); pendingTasks_.push(std::move(fn)); }
+    // TODO: wakeup()
 }
 
 void EventLoop::wakeup() {
-    // TODO: uint64_t one = 1; write(wakeupFd_, &one, sizeof(one))
+    // TODO: uint64_t val = 1; write(wakeupFd_, &val, sizeof(val))
 }
 
 void EventLoop::handlePendingTasks() {
-    // TODO: 加锁 swap 出所有任务，逐个执行
+    // TODO: std::queue<std::function<void()>> tasks
+    // TODO: { std::lock_guard lock(mtx_); std::swap(tasks, pendingTasks_); }
+    // TODO: while (!tasks.empty()) { tasks.front()(); tasks.pop(); }
 }
 
 // ---------- src/Channel.cpp ----------
@@ -6309,20 +6393,21 @@ void EventLoop::handlePendingTasks() {
 Channel::Channel(EventLoop* loop, int fd) : loop_(loop), fd_(fd) {}
 
 void Channel::enableReading(bool on) {
-    // TODO: 设置 events_ |= EPOLLIN 或清除
+    // TODO: ET 模式：若 on，events_ |= EPOLLIN | EPOLLRDHUP | EPOLLET；
+    //       否则 events_ &= ~(EPOLLIN | EPOLLRDHUP)
     // TODO: loop_->updateChannel(this)
 }
 
 void Channel::enableWriting(bool on) {
-    // TODO: events_ |= EPOLLOUT 或清除
+    // TODO: 若 on，events_ |= EPOLLOUT；否则 events_ &= ~EPOLLOUT
     // TODO: loop_->updateChannel(this)
 }
 
 void Channel::handleEvent(int revents) {
-    // TODO: if (revents & (EPOLLRDHUP | EPOLLHUP)) closeCb_()
-    // TODO: if (revents & EPOLLERR) errorCb_()
-    // TODO: if (revents & EPOLLIN) readCb_()
-    // TODO: if (revents & EPOLLOUT) writeCb_()
+    // TODO: if (revents & (EPOLLRDHUP | EPOLLHUP)) { if (closeCb_) closeCb_(); return; }
+    // TODO: if (revents & EPOLLERR) { if (errorCb_) errorCb_(); }
+    // TODO: if (revents & EPOLLIN) { if (readCb_) readCb_(); }
+    // TODO: if (revents & EPOLLOUT) { if (writeCb_) writeCb_(); }
 }
 
 // ---------- src/Acceptor.cpp ----------
@@ -6330,26 +6415,37 @@ void Channel::handleEvent(int revents) {
 #include "Channel.h"
 #include "EventLoop.h"
 #include <arpa/inet.h>
+#include <cstdlib>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 Acceptor::Acceptor(EventLoop* loop, int port) : loop_(loop) {
-    // TODO: listenFd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
+    // TODO: listenFd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
     // TODO: setsockopt(SO_REUSEADDR)
-    // TODO: bind + listen
+    // TODO: bind 到 0.0.0.0:port
     // TODO: acceptChannel_ = new Channel(loop_, listenFd_)
-    // TODO: acceptChannel_->setReadCallback(bind(&Acceptor::handleRead, this))
+    // TODO: acceptChannel_->setReadCallback([this]() { handleRead(); })
+}
+
+Acceptor::~Acceptor() {
+    // TODO: loop_->removeChannel(acceptChannel_)
+    // TODO: delete acceptChannel_
+    // TODO: close(listenFd_)
 }
 
 void Acceptor::listen() {
+    // TODO: listen(listenFd_, SOMAXCONN)
     // TODO: acceptChannel_->enableReading()
 }
 
 void Acceptor::handleRead() {
     // TODO: while (true) {
-    //   int connfd = accept4(listenFd_, ..., SOCK_NONBLOCK)
-    //   if (connfd < 0) break
-    //   newConnCb_(connfd)
+    //   int connFd = accept4(listenFd_, ..., SOCK_NONBLOCK)
+    //   if (connFd < 0 && errno == EAGAIN) break
+    //   if (connFd < 0 && errno == EINTR) continue
+    //   if (connFd < 0) { perror("accept4"); break; }
+    //   if (newConnCb_) newConnCb_(connFd)
     // }
 }
 
@@ -6357,47 +6453,82 @@ void Acceptor::handleRead() {
 #include "TcpConnection.h"
 #include "Channel.h"
 #include "EventLoop.h"
+#include <cerrno>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <cerrno>
+
+int64_t TcpConnection::nowMs() {
+    // TODO: 返回自 epoch 起的毫秒时间戳（std::chrono）
+    return 0;
+}
 
 TcpConnection::TcpConnection(EventLoop* loop, int fd)
-    : loop_(loop), fd_(fd) {
+    : loop_(loop), fd_(fd), lastActiveMs_(nowMs()) {
     // TODO: channel_ = new Channel(loop, fd)
-    // TODO: channel_->setReadCallback(bind(&TcpConnection::handleRead, this))
-    // TODO: channel_->setWriteCallback(bind(&TcpConnection::handleWrite, this))
-    // TODO: channel_->setCloseCallback(bind(&TcpConnection::handleClose, this))
+    // TODO: channel_->setReadCallback([this]() { handleRead(); })
+    // TODO: channel_->setWriteCallback([this]() { handleWrite(); })
+    // TODO: channel_->setCloseCallback([this]() { handleClose(); })
     // TODO: channel_->enableReading()
 }
 
 TcpConnection::~TcpConnection() {
-    // TODO: close(fd_); delete channel_
-}
-
-void TcpConnection::handleRead() {
-    // TODO: char buf[65536]; ssize_t n = read(fd_, buf, sizeof(buf))
-    // TODO: if (n > 0) { inputBuffer_.append(buf, n); messageCb_(shared_from_this(), inputBuffer_); }
-    // TODO: else if (n == 0) handleClose()
-    // TODO: else if (errno != EAGAIN) handleClose()
-}
-
-void TcpConnection::handleWrite() {
-    // TODO: ssize_t n = write(fd_, outputBuffer_.data(), outputBuffer_.size())
-    // TODO: if (n > 0) { outputBuffer_.erase(0, n); if (empty) enableWriting(false); }
-}
-
-void TcpConnection::handleClose() {
-    // TODO: closeCb_(shared_from_this())
     // TODO: loop_->removeChannel(channel_)
+    // TODO: delete channel_
     // TODO: close(fd_)
 }
 
+void TcpConnection::handleRead() {
+    // TODO: ET 模式：while (true) 循环 read 直到内核缓冲区读空
+    // TODO:   n > 0：inputBuffer_.append(buf, n)；touch() 刷新活动时间
+    // TODO:   n == 0：对端正常关闭 → handleClose(); return
+    // TODO:   n < 0：EAGAIN/EWOULDBLOCK → break；EINTR → continue；
+    // TODO:          ECONNRESET/EPIPE 等对端断开静默 handleClose()
+    // TODO: 循环结束后若 msgCb_ 存在，msgCb_(shared_from_this(), inputBuffer_)
+}
+
+void TcpConnection::handleWrite() {
+    // TODO: ET 模式：EPOLLOUT 是边缘触发，while (!outputBuffer_.empty()) 循环 write 直到 EAGAIN
+    // TODO:   n > 0：outputBuffer_.erase(0, n)
+    // TODO:   n < 0：EAGAIN → break（等下一次 EPOLLOUT）；EINTR → continue；其余静默关闭
+    // TODO: 缓冲排空后 channel_->enableWriting(false)，取消 EPOLLOUT 避免空转
+}
+
+void TcpConnection::handleClose() {
+    // TODO: auto self = shared_from_this()（保活到函数结束，防止 closeCb_ 释放最后引用后 this 悬垂）
+    // TODO: if (closeCb_) closeCb_(self)
+    // TODO: loop_->removeChannel(channel_)
+}
+
 void TcpConnection::send(const std::string& data) {
-    // TODO: 若当前未写，直接 write；否则 append 到 outputBuffer_ 并 enableWriting
+    // TODO: 线程安全入口：把实际写 marshal 回连接所属 IO 线程
+    // TODO: if (loop_->isInLoopThread()) sendInLoop(data)
+    // TODO: else loop_->runInLoop([self = shared_from_this(), data]{ self->sendInLoop(data); })
+}
+
+void TcpConnection::sendInLoop(const std::string& data) {
+    // TODO: 仅在 IO 线程执行，独占 outputBuffer_ / channel_ / fd_
+    // TODO: 若 outputBuffer_ 为空，尝试直接 write；未写完则剩余入队并 enableWriting(true)
+    // TODO: 若 outputBuffer_ 非空，直接 append，保证发送顺序
 }
 
 void TcpConnection::shutdown() {
-    // TODO: ::shutdown(fd_, SHUT_WR)
+    // TODO: 同 send，可能从工作线程调用，需 marshal 回 IO 线程执行 shutdownInLoop()
+}
+
+void TcpConnection::shutdownInLoop() {
+    // TODO: 若 outputBuffer_ 为空，::shutdown(fd_, SHUT_WR)（半关闭）
+}
+
+void TcpConnection::setConnectionCallback(std::function<void(const std::shared_ptr<TcpConnection>&)> cb) {
+    connCb_ = std::move(cb);
+}
+
+void TcpConnection::setMessageCallback(std::function<void(const std::shared_ptr<TcpConnection>&, const std::string&)> cb) {
+    msgCb_ = std::move(cb);
+}
+
+void TcpConnection::setCloseCallback(std::function<void(const std::shared_ptr<TcpConnection>&)> cb) {
+    closeCb_ = std::move(cb);
 }
 ```
 
@@ -6427,11 +6558,81 @@ void TcpConnection::shutdown() {
 ```cpp
 // === 8.3 HTTP 协议层实现 练习框架 ===
 // 项目结构:
-// http-server/src/
-// ├── HttpHandler.h
-// └── HttpHandler.cpp
+// http-server/
+// ├── include/
+// │   ├── HttpRequest.h
+// │   ├── HttpResponse.h
+// │   └── HttpHandler.h
+// └── src/
+//     ├── HttpRequest.cpp
+//     ├── HttpResponse.cpp
+//     └── HttpHandler.cpp
 
-// ---------- src/HttpHandler.h ----------
+// ---------- include/HttpRequest.h ----------
+#pragma once
+#include <string>
+#include <unordered_map>
+
+class HttpRequest {
+public:
+    enum class State {
+        ParsingRequestLine,
+        ParsingHeaders,
+        ParsingBody,
+        Complete,
+        Error
+    };
+
+    HttpRequest() : state_(State::ParsingRequestLine) {}
+
+    bool parseRequestLine(const std::string& line);
+    bool parseHeader(const std::string& line);
+    void parseBody(const std::string& body);
+    static std::string urlDecode(const std::string& str);
+
+    const std::string& method() const { return method_; }
+    const std::string& uri() const { return uri_; }
+    const std::string& version() const { return version_; }
+    const std::string& body() const { return body_; }
+    std::string header(const std::string& key) const;
+    bool keepAlive() const;
+    State state() const { return state_; }
+    void setState(State s) { state_ = s; }
+
+private:
+    State state_;
+    std::string method_;
+    std::string uri_;
+    std::string version_;
+    std::string body_;
+    std::unordered_map<std::string, std::string> headers_;
+};
+
+// ---------- include/HttpResponse.h ----------
+#pragma once
+#include <string>
+#include <unordered_map>
+
+class HttpResponse {
+public:
+    explicit HttpResponse(int statusCode = 200);
+
+    void setStatusCode(int code) { statusCode_ = code; }
+    void setHeader(const std::string& key, const std::string& value);
+    void setBody(const std::string& body);
+    std::string serialize() const;
+    static std::string mimeFromExt(const std::string& ext);
+    int statusCode() const { return statusCode_; }
+    const std::string& body() const { return body_; }
+
+private:
+    int statusCode_;
+    std::string reasonPhrase_;
+    std::unordered_map<std::string, std::string> headers_;
+    std::string body_;
+};
+
+// ---------- include/HttpHandler.h ----------
 #pragma once
 #include <memory>
 #include <string>
@@ -6442,56 +6643,152 @@ class HttpResponse;
 
 class HttpHandler {
 public:
+    explicit HttpHandler(const std::string& docRoot = "./www",
+                         const std::string& strategy = "readwrite");
     void onRequest(const std::shared_ptr<TcpConnection>& conn, const std::string& input);
 
 private:
     bool parseRequest(const std::string& input, HttpRequest& req);
     void buildResponse(const HttpRequest& req, HttpResponse& resp);
-    void serveStaticFile(const std::string& uri, const std::string& docRoot, HttpResponse& resp);
+    // 静态文件：header 与 body 分离发送，body 走 StaticFileSender 策略（8.6 压测对比）
+    void serveStatic(const std::shared_ptr<TcpConnection>& conn, const HttpRequest& req, bool headOnly);
     void handleError(const std::shared_ptr<TcpConnection>& conn, int code, const std::string& reason);
+    std::string docRoot_;
+    std::string strategy_;   // 静态文件发送策略: readwrite | mmap
 };
+
+// ---------- src/HttpRequest.cpp ----------
+#include "HttpRequest.h"
+#include <sstream>
+
+bool HttpRequest::parseRequestLine(const std::string& line) {
+    // TODO: 按空格分割 "METHOD URI VERSION"
+    // TODO: 校验 method 是否为 GET/POST/HEAD/OPTIONS
+    // TODO: 设置 method_、uri_（含 urlDecode）、version_
+    // TODO: 状态转移至 ParsingHeaders
+    return false;
+}
+
+bool HttpRequest::parseHeader(const std::string& line) {
+    // TODO: 若 line 为空，表示 Header 结束
+    //   判断 Content-Length > 0 则状态转移至 ParsingBody，否则 Complete
+    // TODO: 按 ':' 分割 key: value 存入 headers_（key 转小写）
+    return false;
+}
+
+void HttpRequest::parseBody(const std::string& body) {
+    // TODO: body_ = body; state_ = Complete
+}
+
+std::string HttpRequest::urlDecode(const std::string& str) {
+    // TODO: %xx 转字符，+ 转空格
+    return str;
+}
+
+std::string HttpRequest::header(const std::string& key) const {
+    // TODO: 在 headers_ 中查找（key 小写），返回对应值或空串
+    return "";
+}
+
+bool HttpRequest::keepAlive() const {
+    // TODO: HTTP/1.1 默认 keep-alive
+    // TODO: 检查 Connection: close 头，若存在则返回 false
+    return true;
+}
+
+// ---------- src/HttpResponse.cpp ----------
+#include "HttpResponse.h"
+#include <sstream>
+
+HttpResponse::HttpResponse(int statusCode) : statusCode_(statusCode) {
+    // TODO: 根据 statusCode_ 设置 reasonPhrase_
+    // 常见映射: 200->OK, 400->Bad Request, 403->Forbidden, 404->Not Found,
+    //           405->Method Not Allowed, 500->Internal Server Error
+}
+
+void HttpResponse::setHeader(const std::string& key, const std::string& value) {
+    // TODO: headers_[key] = value
+}
+
+void HttpResponse::setBody(const std::string& body) {
+    // TODO: body_ = body
+    // TODO: 自动设置 Content-Length
+}
+
+std::string HttpResponse::serialize() const {
+    // TODO: 拼接 "HTTP/1.1 {code} {reason}\r\n"
+    // TODO: 拼接所有 Header "key: value\r\n"
+    // TODO: 拼接 "\r\n"
+    // TODO: 拼接 body_
+    return "";
+}
+
+std::string HttpResponse::mimeFromExt(const std::string& ext) {
+    // TODO: 根据文件扩展名返回 MIME 类型
+    // html -> text/html, css -> text/css, js -> application/javascript,
+    // png -> image/png, jpg -> image/jpeg, gif -> image/gif,
+    // ico -> image/x-icon, txt -> text/plain, json -> application/json
+    // 未知扩展名 -> application/octet-stream
+    return "application/octet-stream";
+}
 
 // ---------- src/HttpHandler.cpp ----------
 #include "HttpHandler.h"
 #include "HttpRequest.h"
 #include "HttpResponse.h"
+#include "StaticFileSender.h"
 #include "TcpConnection.h"
+#include "Logger.h"
 #include <fstream>
 #include <sstream>
+#include <sys/stat.h>
+
+HttpHandler::HttpHandler(const std::string& docRoot, const std::string& strategy)
+    : docRoot_(docRoot), strategy_(strategy) {
+}
 
 void HttpHandler::onRequest(const std::shared_ptr<TcpConnection>& conn, const std::string& input) {
-    HttpRequest req;
-    HttpResponse resp;
+    // TODO: HttpRequest req;
     // TODO: if (!parseRequest(input, req)) { handleError(conn, 400, "Bad Request"); return; }
-    // TODO: buildResponse(req, resp)
-    // TODO: conn->send(resp.serialize())
+    // TODO: if (method == "GET" || method == "HEAD") serveStatic(conn, req, method == "HEAD");
+    // TODO: else { buildResponse(req, resp); conn->send(resp.serialize()); }   // POST/OPTIONS/405
+    // TODO: 若非 keepAlive，conn->shutdown()
 }
 
 bool HttpHandler::parseRequest(const std::string& input, HttpRequest& req) {
-    // TODO: 实现状态机解析：请求行 → Header → Body
-    // TODO: 处理请求行过长、Header 过多等异常
+    // TODO: 按 \r\n 逐行分割 input
+    // TODO: 第一行调用 req.parseRequestLine()
+    // TODO: 后续行调用 req.parseHeader()，空行后剩余部分为 body
+    // TODO: 检查请求行长度不超过 8KB，Header 不超过 100 个
     return false;
 }
 
 void HttpHandler::buildResponse(const HttpRequest& req, HttpResponse& resp) {
-    const std::string& method = req.method();
-    const std::string& uri = req.uri();
-    // TODO: if (method == "GET" || method == "HEAD") serveStaticFile(uri, "./www", resp)
-    // TODO: else if (method == "POST") { 解析 body，返回 echo }
-    // TODO: else if (method == "OPTIONS") { 返回 Allow 头 }
-    // TODO: else resp = HttpResponse(405)
+    // 注：GET / HEAD 已在 onRequest 中路由到 serveStatic，此处只处理非静态方法
+    // TODO: if (method == "POST") { resp.setBody(req.body()); resp.setHeader("Content-Type","text/plain"); }
+    // TODO: else if (method == "OPTIONS") { resp = HttpResponse(204); resp.setHeader("Allow","GET, POST, HEAD, OPTIONS"); }
+    // TODO: else resp = HttpResponse(405); resp.setHeader("Allow", ...)
+    // TODO: 设置 Connection: keep-alive 或 close
 }
 
-void HttpHandler::serveStaticFile(const std::string& uri, const std::string& docRoot, HttpResponse& resp) {
-    // TODO: 拼接路径 path = docRoot + HttpRequest::urlDecode(uri)
-    // TODO: 检查路径合法性（不允许 ../）
-    // TODO: std::ifstream 读取文件内容
-    // TODO: 设置 Content-Type（根据后缀）、Content-Length
-    // TODO: 文件不存在 resp = HttpResponse(404) 并返回 404.html
+// 静态文件：header 与 body 分离发送，body 经 StaticFileSender 按策略发送（8.6）
+void HttpHandler::serveStatic(const std::shared_ptr<TcpConnection>& conn,
+                              const HttpRequest& req, bool headOnly) {
+    // TODO: path = docRoot_ + uri（uri 已在解析阶段 urlDecode，不可再解码）
+    // TODO: 若 uri == "/"，path += "index.html"
+    // TODO: 路径合法性检查（含 ".." → 直接发送 403 响应并 return）
+    // TODO: ::stat 探测：不存在或非常规文件 → 发送 404（读取 404.html 作 body）并 return
+    // TODO: 构造 header-only 响应（Content-Type 按 mimeFromExt、Content-Length = st.st_size、Connection），
+    //       conn->send(resp.serialize()) 只发 header + 空行（body 留空）
+    // TODO: if (headOnly) return;   // HEAD 保留 Content-Length 但不发 body
+    // TODO: body 按 strategy_ 分策略发送：mmap → StaticFileSender::sendWithMmap；否则 sendWithReadWrite
 }
 
 void HttpHandler::handleError(const std::shared_ptr<TcpConnection>& conn, int code, const std::string& reason) {
-    // TODO: 构造错误响应并发送
+    // TODO: HttpResponse resp(code)
+    // TODO: resp.setHeader("Content-Type", "text/html")
+    // TODO: resp.setBody("<html><body><h1>" + reason + "</h1></body></html>")
+    // TODO: conn->send(resp.serialize())
 }
 ```
 
@@ -6520,14 +6817,16 @@ void HttpHandler::handleError(const std::shared_ptr<TcpConnection>& conn, int co
 ```cpp
 // === 8.4 多线程 Reactor 与定时器 练习框架 ===
 // 项目结构:
-// http-server/src/
-// ├── ThreadPool.h
-// ├── ThreadPool.cpp
-// ├── TimerQueue.h
-// ├── TimerQueue.cpp
-// └── HttpServer.cpp
+// http-server/
+// ├── include/
+// │   ├── ThreadPool.h
+// │   └── TimerQueue.h
+// └── src/
+//     ├── ThreadPool.cpp
+//     ├── TimerQueue.cpp
+//     └── HttpServer.cpp
 
-// ---------- src/ThreadPool.h ----------
+// ---------- include/ThreadPool.h ----------
 #pragma once
 #include <condition_variable>
 #include <functional>
@@ -6555,19 +6854,28 @@ private:
 
 ThreadPool::ThreadPool(int size) {
     // TODO: 启动 size 个 worker 线程
-    // TODO: worker 循环：加锁 → cv_.wait → 取任务 → 执行
+    // TODO: 每个 worker 循环：
+    //   {
+    //     std::unique_lock lock(mtx_)
+    //     cv_.wait(lock, [this]{ return stop_ || !tasks_.empty(); })
+    //     if (stop_ && tasks_.empty()) return
+    //     auto task = std::move(tasks_.front()); tasks_.pop()
+    //   }
+    //   task()
 }
 
 ThreadPool::~ThreadPool() {
-    // TODO: stop_ = true; cv_.notify_all()
-    // TODO: 遍历 join 所有 worker
+    // TODO: { std::lock_guard lock(mtx_); stop_ = true; }
+    // TODO: cv_.notify_all()
+    // TODO: 遍历 workers_，join 每个线程
 }
 
 void ThreadPool::addTask(std::function<void()> task) {
-    // TODO: 加锁 push 到 tasks_; cv_.notify_one()
+    // TODO: { std::lock_guard lock(mtx_); tasks_.push(std::move(task)); }
+    // TODO: cv_.notify_one()
 }
 
-// ---------- src/TimerQueue.h ----------
+// ---------- include/TimerQueue.h ----------
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -6584,7 +6892,8 @@ class TimerQueue {
 public:
     void addTimer(int64_t expireMs, std::function<void()> cb);
     void processExpiredTimers();  // 在 EventLoop 线程调用
-    int64_t nextExpireMs() const;
+    int64_t nextExpireMs() const;  // 返回距离下一次超时的毫秒数，-1 表示无定时器
+    bool empty() const { return heap_.empty(); }
 
 private:
     std::priority_queue<TimerNode, std::vector<TimerNode>, std::greater<TimerNode>> heap_;
@@ -6604,13 +6913,17 @@ void TimerQueue::addTimer(int64_t expireMs, std::function<void()> cb) {
 }
 
 void TimerQueue::processExpiredTimers() {
-    // TODO: while (!heap_.empty() && heap_.top().expireMs <= nowMs()) {
-    //   取出并执行回调
+    // TODO: int64_t now = nowMs()
+    // TODO: while (!heap_.empty() && heap_.top().expireMs <= now) {
+    //   auto cb = std::move(const_cast<TimerNode&>(heap_.top()).cb)
+    //   heap_.pop(); cb();
     // }
 }
 
 int64_t TimerQueue::nextExpireMs() const {
-    // TODO: return heap_.empty() ? -1 : heap_.top().expireMs
+    // TODO: if (heap_.empty()) return -1
+    // TODO: int64_t remain = heap_.top().expireMs - nowMs()
+    // TODO: return remain > 0 ? remain : 0
     return -1;
 }
 
@@ -6618,31 +6931,84 @@ int64_t TimerQueue::nextExpireMs() const {
 #include "HttpServer.h"
 #include "Acceptor.h"
 #include "EventLoop.h"
+#include "HttpHandler.h"
+#include "Logger.h"
 #include "TcpConnection.h"
 #include "ThreadPool.h"
 #include "TimerQueue.h"
+#include <csignal>
+#include <thread>
 
-HttpServer::HttpServer(int port, int subCount, int poolSize) : port_(port) {
-    // TODO: 创建 subCount 个 sub EventLoop，每个在独立线程 loop()
-    // TODO: acceptor_ = std::make_unique<Acceptor>(&mainLoop_, port)
-    // TODO: acceptor_->setNewConnCallback(bind(&HttpServer::onNewConnection, this, ...))
-    // TODO: threadPool_ = std::make_unique<ThreadPool>(poolSize)
-    // TODO: timerQueue_ = std::make_unique<TimerQueue>()
+static HttpServer* g_server = nullptr;   // 仅支持单实例（信号处理需要全局入口）
+
+// TODO: static int64_t nowMs()  // epoch 毫秒时间戳，供 scheduleIdleClose 空闲超时计算
+
+static void signalHandler(int) {
+    // 信号路径只做 async-signal-safe 操作：stop() 内部仅置原子标志 + write(eventfd)
+    // TODO: if (g_server) g_server->stop()
+}
+
+HttpServer::HttpServer(int port, int subReactorCount, int threadPoolSize) : port_(port) {
+    // TODO: signal(SIGPIPE, SIG_IGN)
+    // TODO: signal(SIGTERM, signalHandler); signal(SIGINT, signalHandler)
+    // TODO: g_server = this
+    // TODO: mainLoop_ = std::make_unique<EventLoop>()
+    // TODO: acceptor_ = std::make_unique<Acceptor>(mainLoop_.get(), port)
+    // TODO: acceptor_->setNewConnCallback([this](int fd) { onNewConnection(fd); })
+    // TODO: threadPool_ = std::make_unique<ThreadPool>(threadPoolSize)
+    // TODO: 创建 subReactorCount 个 sub EventLoop，每个在独立线程中构造并 loop()
+    //   （用 std::promise/future 移交所有权，确保 subLoop 在其归属线程构造，threadId_ 记录正确）
+}
+
+HttpServer::~HttpServer() {
+    // TODO: 停止所有 subLoop（遍历调用 quit()）
+    // TODO: join 所有 subThreads_
 }
 
 void HttpServer::start() {
+    // TODO: LOG_INFO("HttpServer started on port %d", port_)
     // TODO: acceptor_->listen()
-    // TODO: mainLoop_.loop()
+    // TODO: mainLoop_->loop()
+}
+
+void HttpServer::stop() {
+    // TODO: mainLoop_->quit()
+    // TODO: 遍历 subLoops_ 调用 quit()
 }
 
 void HttpServer::onNewConnection(int fd) {
-    // TODO: 轮询选择一个 subLoop
-    // TODO: subLoop->runInLoop 创建 TcpConnection，设置 messageCallback 到 onRequest
+    // TODO: 若 subLoops_ 为空则 ::close(fd) 兜底并 return
+    // TODO: 轮询选择 subLoop: int idx = nextSub_.fetch_add(1) % subLoops_.size()
+    // TODO: subLoop->runInLoop 中创建 TcpConnection，设置 messageCallback→onRequest、closeCallback→onClose
+    // TODO: 加锁 connections_[fd] = conn（必须先入 map，handleRead 里 shared_from_this 才有效）
+    // TODO: 调用 scheduleIdleClose(subLoop, fd, conn, connTimeoutMs_) 挂载空闲超时定时器
+}
+
+// 空闲超时：自校验定时器（捕获 weak_ptr + fd 身份校验），
+// 陈旧定时器对已析构连接自动失效，绝不误删后来复用同一 fd 的新连接（旧实现以裸 fd 为身份 → SIGABRT）
+void HttpServer::scheduleIdleClose(EventLoop* loop, int fd,
+                                   std::weak_ptr<TcpConnection> weak, int64_t delayMs) {
+    // TODO: loop->timerQueue()->addTimer(nowMs()+delayMs, [this, loop, fd, weak]{
+    //   auto conn = weak.lock(); if (!conn) return;             // 已析构，陈旧定时器失效
+    //   int64_t idle = nowMs() - conn->lastActiveMs();          // 真·空闲：有活动则按剩余时间顺延
+    //   if (idle < connTimeoutMs_) { scheduleIdleClose(loop, fd, weak, connTimeoutMs_-idle); return; }
+    //   加锁校验 connections_[fd] == conn 才 erase；让 conn 于本 IO 线程析构（勿持锁析构，防死锁）
+    // })
 }
 
 void HttpServer::onRequest(const std::shared_ptr<TcpConnection>& conn, const std::string& msg) {
-    // TODO: 把业务处理投递到 threadPool_
-    // TODO: 处理完后 conn->send(resp.serialize())
+    // TODO: 复制 msg（msg 是 inputBuffer_ 引用），conn->retrieveAllInput() 清缓冲以接 keep-alive 下一请求
+    // TODO: 把业务处理投递到 threadPool_：
+    //   threadPool_->addTask([this, conn, request]() {
+    //     HttpHandler handler(docRoot_, staticStrategy_);   // 注入静态文件发送策略
+    //     handler.onRequest(conn, request);
+    //   })
+    // TODO: 注意：send 内部应确保线程安全（通过 runInLoop 回到 IO 线程写）
+}
+
+void HttpServer::onClose(const std::shared_ptr<TcpConnection>& conn) {
+    // TODO: 加锁从 connections_ 中 erase(conn->fd())
+    // TODO: LOG_INFO("connection closed: fd=%d", conn->fd())
 }
 ```
 
@@ -6671,15 +7037,19 @@ void HttpServer::onRequest(const std::shared_ptr<TcpConnection>& conn, const std
 ```cpp
 // === 8.5 日志、配置与测试 练习框架 ===
 // 项目结构:
-// http-server/src/
-// ├── Logger.h
-// ├── Logger.cpp
-// ├── Config.h
-// ├── Config.cpp
-// └── tests/
-//     └── test_http_parser.cpp
+// http-server/
+// ├── include/
+// │   ├── Logger.h
+// │   └── Config.h
+// ├── src/
+// │   ├── Logger.cpp
+// │   └── Config.cpp
+// ├── tests/
+// │   └── test_http_parser.cpp
+// └── conf/
+//     └── server.conf
 
-// ---------- src/Logger.h ----------
+// ---------- include/Logger.h ----------
 #pragma once
 #include <fstream>
 #include <mutex>
@@ -6713,6 +7083,7 @@ private:
 #include <cstdio>
 #include <ctime>
 #include <iostream>
+#include <thread>
 
 Logger& Logger::instance() {
     static Logger inst;
@@ -6721,18 +7092,20 @@ Logger& Logger::instance() {
 
 void Logger::setOutput(const std::string& path) {
     std::lock_guard<std::mutex> lk(mtx_);
-    ofs_.open(path, std::ios::app);
+    // TODO: ofs_.open(path, std::ios::app)
 }
 
 void Logger::log(LogLevel lv, const char* file, int line, const char* fmt, ...) {
     if (lv < level_) return;
     // TODO: 获取当前时间戳（精确到毫秒）
-    // TODO: 获取当前线程 ID
-    // TODO: 格式化 "[时间] [级别] [线程ID] [文件:行号] 消息\n"
-    // TODO: 加锁输出到 ofs_ 或 stdout
+    // TODO: 获取当前线程 ID（std::this_thread::get_id()）
+    // TODO: 级别名称映射: DEBUG/INFO/WARN/ERROR
+    // TODO: vsnprintf 格式化消息
+    // TODO: 加锁输出格式: "[2026-01-01 12:00:00.123] [INFO] [tid:140234] [file:line] message\n"
+    // TODO: 输出到 ofs_（若已打开）或 stdout
 }
 
-// ---------- src/Config.h ----------
+// ---------- include/Config.h ----------
 #pragma once
 #include <string>
 #include <unordered_map>
@@ -6753,9 +7126,12 @@ private:
 #include <sstream>
 
 bool Config::load(const std::string& path) {
-    // TODO: std::ifstream 读取每行
-    // TODO: 跳过 # 注释行
-    // TODO: 按 '=' 分割 key=value 存入 data_
+    // TODO: std::ifstream ifs(path)
+    // TODO: 若打不开返回 false
+    // TODO: 逐行读取：
+    //   跳过空行和 '#' 开头的注释行
+    //   按 '=' 分割 key=value
+    //   trim 空白后存入 data_[key] = value
     return false;
 }
 
@@ -6769,6 +7145,18 @@ std::string Config::getString(const std::string& key, const std::string& def) co
     return it == data_.end() ? def : it->second;
 }
 
+// ---------- conf/server.conf ----------
+// # HTTP Server 配置文件
+// port = 8080
+// sub_reactor_count = 3
+// thread_pool_size = 4
+// document_root = ./www
+// log_path = ./http-server.log
+// log_level = INFO
+// connection_timeout_ms = 30000
+// # 静态文件发送策略（8.6 压测对比）: readwrite | mmap
+// static_file_strategy = readwrite
+
 // ---------- tests/test_http_parser.cpp ----------
 #include "HttpRequest.h"
 #include "HttpResponse.h"
@@ -6780,23 +7168,57 @@ void testParseRequestLine() {
     assert(req.parseRequestLine("GET /index.html HTTP/1.1"));
     assert(req.method() == "GET");
     assert(req.uri() == "/index.html");
+    assert(req.version() == "HTTP/1.1");
+    std::cout << "[PASS] testParseRequestLine\n";
 }
 
 void testUrlDecode() {
     assert(HttpRequest::urlDecode("hello%20world") == "hello world");
     assert(HttpRequest::urlDecode("a+b") == "a b");
+    assert(HttpRequest::urlDecode("%E4%BD%A0%E5%A5%BD") == "你好");
+    std::cout << "[PASS] testUrlDecode\n";
 }
 
 void testMime() {
     assert(HttpResponse::mimeFromExt("html") == "text/html");
     assert(HttpResponse::mimeFromExt("png") == "image/png");
+    assert(HttpResponse::mimeFromExt("css") == "text/css");
+    assert(HttpResponse::mimeFromExt("js") == "application/javascript");
+    assert(HttpResponse::mimeFromExt("unknown_ext") == "application/octet-stream");
+    std::cout << "[PASS] testMime\n";
+}
+
+void testResponseSerialize() {
+    HttpResponse resp(200);
+    resp.setHeader("Content-Type", "text/plain");
+    resp.setBody("hello");
+    std::string out = resp.serialize();
+    assert(out.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+    assert(out.find("Content-Length: 5\r\n") != std::string::npos);
+    assert(out.find("\r\n\r\nhello") != std::string::npos);
+    std::cout << "[PASS] testResponseSerialize\n";
+}
+
+void testKeepAlive() {
+    HttpRequest req;
+    req.parseRequestLine("GET / HTTP/1.1");
+    req.parseHeader("Connection: keep-alive");
+    assert(req.keepAlive() == true);
+
+    HttpRequest req2;
+    req2.parseRequestLine("GET / HTTP/1.1");
+    req2.parseHeader("Connection: close");
+    assert(req2.keepAlive() == false);
+    std::cout << "[PASS] testKeepAlive\n";
 }
 
 int main() {
     testParseRequestLine();
     testUrlDecode();
     testMime();
-    std::cout << "all tests passed\n";
+    testResponseSerialize();
+    testKeepAlive();
+    std::cout << "\n=== all tests passed ===\n";
     return 0;
 }
 ```
@@ -6831,38 +7253,26 @@ int main() {
 // === 8.6 压测与优化 练习框架 ===
 // 项目结构:
 // http-server/
-// ├── bench/
-// │   ├── bench_client.cpp  // 压测客户端
-// │   └── run_bench.sh      // 压测脚本
-// └── src/
-//     └── StaticFileSender.cpp  // 练习3: sendfile 优化
+// ├── include/
+// │   └── StaticFileSender.h
+// ├── src/
+// │   └── StaticFileSender.cpp
+// └── bench/
+//     └── run_bench.sh      // 压测脚本
 
-// ---------- bench/bench_client.cpp ----------
-// 练习1: 用 WebBench / wrk / ab 压测
-// 命令示例:
-//   webbench -c 100 -t 10 http://127.0.0.1:8080/index.html
-//   wrk -t4 -c100 -d10s http://127.0.0.1:8080/index.html
-//   ab -n 10000 -c 100 http://127.0.0.1:8080/index.html
-
-// ---------- bench/run_bench.sh ----------
-// #!/bin/bash
-// echo "=== WebBench ==="
-// webbench -c 100 -t 10 http://127.0.0.1:8080/index.html
-// echo "=== perf record ==="
-// perf record -p $(pgrep http-server) -g -- sleep 10
-// perf report
-// echo "=== strace -c ==="
-// strace -c -p $(pgrep http-server) sleep 5
-
-// ---------- src/StaticFileSender.cpp ----------
+// ---------- include/StaticFileSender.h ----------
 #pragma once
+#include <memory>
 #include <string>
 
 class TcpConnection;
 
 class StaticFileSender {
 public:
-    // 练习3: 优化发送静态文件
+    // 练习3: 优化发送静态文件（三种方式对比）
+    // 注：HttpHandler::serveStatic 采用 header/body 分离发送，body 经此处按
+    //     配置项 static_file_strategy 分发；readwrite / mmap 已接入，
+    //     sendfile 需改造 TcpConnection 的 IO 线程发送链，保留为进阶练习。
     static void sendWithReadWrite(const std::shared_ptr<TcpConnection>& conn, const std::string& path);
     static void sendWithSendfile(const std::shared_ptr<TcpConnection>& conn, const std::string& path);
     static void sendWithMmap(const std::shared_ptr<TcpConnection>& conn, const std::string& path);
@@ -6878,109 +7288,52 @@ public:
 #include <unistd.h>
 
 void StaticFileSender::sendWithReadWrite(const std::shared_ptr<TcpConnection>& conn, const std::string& path) {
-    // TODO: open + fstat + read 到 buf + conn->send(buf) + close
+    // TODO: int fd = open(path.c_str(), O_RDONLY)
+    // TODO: struct stat st; fstat(fd, &st)
+    // TODO: std::string buf(st.st_size, '\0')
+    // TODO: read(fd, buf.data(), st.st_size)
+    // TODO: conn->send(buf)
+    // TODO: close(fd)
 }
 
 void StaticFileSender::sendWithSendfile(const std::shared_ptr<TcpConnection>& conn, const std::string& path) {
-    // TODO: int in = open(path, O_RDONLY)
-    // TODO: struct stat st; fstat(in, &st)
-    // TODO: sendfile(conn->fd(), in, nullptr, st.st_size)  // 零拷贝
-    // TODO: close(in)
+    // TODO: int inFd = open(path.c_str(), O_RDONLY)
+    // TODO: struct stat st; fstat(inFd, &st)
+    // TODO: off_t offset = 0
+    // TODO: sendfile(conn->fd(), inFd, &offset, st.st_size)  // 零拷贝
+    // TODO: close(inFd)
 }
 
 void StaticFileSender::sendWithMmap(const std::shared_ptr<TcpConnection>& conn, const std::string& path) {
-    // TODO: int fd = open(path, O_RDONLY)
+    // TODO: int fd = open(path.c_str(), O_RDONLY)
     // TODO: struct stat st; fstat(fd, &st)
     // TODO: void* p = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)
-    // TODO: conn->send(string((char*)p, st.st_size))
-    // TODO: munmap + close
+    // TODO: conn->send(std::string((char*)p, st.st_size))
+    // TODO: munmap(p, st.st_size)
+    // TODO: close(fd)
 }
+
+// ---------- bench/run_bench.sh ----------
+// 目标：自动跑「多种静态文件发送策略」并输出 QPS 对比表（8.6 优化前后对比）。
+// 定位：脚本是外部工具，不参与 C++ 编译；仅通过 HTTP 端口 8080 与进程名 http-server 与被测服务交互。
+// 骨架流程：
+//   1. 定位/构建二进制：优先 $BIN / build/http-server，缺失时 cmake 自动构建
+//   2. 压测工具自动降级探测：wrk → ab → webbench →（都没有时）curl keep-alive 吞吐估算
+//   3. 遍历 STRATEGIES（默认 "readwrite mmap"）：
+//        sed 改 conf/server.conf 的 static_file_strategy → 起服（子 shell exec，记录 PID）
+//        → 等端口就绪 → 施压采集 QPS → 校验服务器存活（中途崩溃则本轮作废）→ 停服并等端口释放
+//   4. 可选 DO_STRACE/DO_PERF：strace -c 统计系统调用、perf record/report 找 CPU 热点
+//   5. 输出对比汇总表：各策略 QPS 及相对基线百分比
+// 用法示例：
+//   bash bench/run_bench.sh                         # readwrite vs mmap
+//   REQUESTS=20000 FB_PAR=100 bash bench/run_bench.sh
+//   head -c 4M /dev/urandom | base64 > www/big.txt  # 大文件下 mmap/零拷贝收益更明显
+//   URI=/big.txt bash bench/run_bench.sh
 ```
 
 </details>
 
 ## 8.7 项目总结与文档
-
-- **练习目标**：
-    - 整理项目代码，写 README（项目介绍、特性、编译、运行、压测结果、架构图）。
-    - 总结项目中的核心知识点与踩坑记录。
-    - 把项目上传 GitHub，作为简历上的亮点。
-- **练习任务**：
-    1. 写 README.md：项目简介、特性列表、架构图、编译运行说明、压测结果、TODO。
-    2. 整理代码：删除调试代码、统一命名风格、补全注释。
-    3. 写一份"踩坑记录"：至少 5 条（如 epoll ET 模式踩坑、连接生命周期踩坑等）。
-    4. 上传 GitHub，配好 .gitignore、LICENSE。
-- **巩固标准**：
-    - [ ] README 能让陌生人照着编译运行成功。
-    - [ ] 能在 5 分钟内向面试官讲清楚项目架构与亮点。
-    - [ ] 能对比自己的实现与 muduo / TinyWebServer 等开源项目的异同。
-
-<details>
-<summary>📦 练习框架代码</summary>
-
-```cpp
-// === 8.7 项目总结与文档 练习框架 ===
-// 项目结构:
-// http-server/
-// ├── README.md
-// ├── docs/
-// │   ├── pitfalls.md   // 踩坑记录
-// │   └── architecture.png  // 架构图
-// ├── .gitignore
-// └── LICENSE
-
-// ---------- README.md 模板 ----------
-// # 高性能 HTTP 服务器
-//
-// ## 项目简介
-// 一个基于多线程 Reactor 模型的高性能 HTTP/1.1 服务器，支持静态文件、长连接、优雅退出。
-//
-// ## 特性
-// - 主从 Reactor + 线程池架构
-// - 支持 HTTP/1.1 长连接（Keep-Alive）
-// - 支持 GET / HEAD / POST / OPTIONS
-// - 静态文件发送（sendfile 零拷贝）
-// - 最小堆定时器处理超时连接
-// - 异步日志
-// - 优雅退出
-//
-// ## 架构图
-// ![架构](docs/architecture.png)
-//
-// ## 编译运行
-// ```bash
-// mkdir build && cd build
-// cmake ..
-// make -j
-// ./http-server
-// ```
-//
-// ## 压测结果
-// | 并发 | QPS | 平均延迟 | P99 |
-// |---|---|---|---|
-// | 100 | XXXX | Xms | Xms |
-//
-// ## TODO
-// - [ ] WebSocket 支持
-// - [ ] HTTPS
-// - [ ] CGI
-
-// ---------- docs/pitfalls.md 模板 ----------
-// # 踩坑记录
-//
-// 1. **epoll ET 模式漏读数据**：ET 模式下必须循环 read 直到返回 EAGAIN，否则会丢数据。
-// 2. **TcpConnection 生命周期**：用 shared_ptr + enable_shared_from_this，避免回调时对象已析构。
-// 3. **跨线程投递任务**：必须 eventfd 唤醒 EventLoop，否则 epoll_wait 不会立即返回。
-// 4. **定时器回调中删除自己**：不能在回调中直接 delete this，要用 weak_ptr 或延迟删除。
-// 5. **SIGPIPE 导致进程退出**：服务器必须 signal(SIGPIPE, SIG_IGN)。
-
-// ---------- .gitignore ----------
-// build/
-// *.o
-// *.log
-// compile_commands.json
-```
-
-</details>
+[阶段八 README](../code/stage08/http-server/docs/README.md)
 
 ---

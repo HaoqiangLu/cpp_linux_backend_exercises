@@ -12,6 +12,7 @@
 | v1.1 | 2026-10-01 | 补充阶段五：Linux 系统编程进阶（无代码精简版） | 阿米亚波 |
 | v1.2 | 2026-10-04 | 补充阶段六：网络编程进阶（无代码精简版） | 阿米亚波 |
 | v1.3 | 2026-10-06 | 补充阶段七：数据库、缓存与 HTTP（无代码精简版） | 阿米亚波 |
+| v1.4 | 2026-10-10 | 补充阶段八：综合项目 —— 高性能 HTTP 服务器（无代码精简版） | 阿米亚波 |
 
 ---
 
@@ -737,5 +738,131 @@
       > **知识讲解**：GET 和 POST 的核心区别在于**语义**而非技术实现。GET 用于**获取资源**，语义上是**幂等**的（多次请求结果相同、无副作用），因此可被浏览器缓存、可收藏书签、可被 CDN 缓存；POST 用于**提交数据**，语义上**非幂等**（每次提交可能产生不同效果，如创建订单），默认不被缓存。技术层面的区别：① GET 将参数编码在 URL 中（`?key=value`），受 URL 长度限制（浏览器通常 2KB~8KB），POST 将数据放在请求体中，理论上无大小限制；② GET 请求是幂等的，重复发送不会产生副作用，POST 则可能重复提交（如重复下单）；③ GET 只支持 URL 编码（`application/x-www-form-urlencoded`），POST 支持多种 Content-Type（`multipart/form-data` 上传文件、`application/json` 等）。**工程实践**：RESTful API 中 GET 用于查询、POST 用于创建、PUT 用于更新、DELETE 用于删除，严格遵循语义而非技术差异。
     - [ ] 能处理 chunked 编码的解码（读取 chunk size → 读取 chunk data → 直到 0 长度 chunk）。
       > **知识讲解**：chunked 编码是 HTTP/1.1 引入的**分块传输机制**，用于服务器事先不知道响应体总大小的场景（如动态生成内容、流式输出）。格式为：每个 chunk 由**一行十六进制的 chunk size**（不含 `\r\n` 长度本身）+ `\r\n` + **chunk data**（恰好 size 字节）+ `\r\n` 组成；最后一个 chunk 的 size 为 `0`，表示传输结束，之后可能跟随 trailer headers（可选）。解码流程：① 读一行直到 `\r\n`，解析为十六进制整数 size；② 若 size == 0，解码结束；③ 读取 size 字节的数据；④ 读取 2 字节 `\r\n`（chunk 尾部分隔符）；⑤ 重复①。与 Content-Length 的对比：Content-Length 需要服务器提前计算总大小，适合静态文件；chunked 不需要预知大小，适合动态流式响应，但增加了 chunk 头尾的解析开销。**工程实践**：HTTP/2 已废弃 chunked 编码，改用帧（frame）机制传输数据，但 HTTP/1.1 场景仍需支持。
+
+---
+
+# 阶段八：综合项目 —— 高性能 HTTP 服务器
+
+> **定位**：整条学习路线的**重心**。把前面所有知识点（STL / 现代 C++ / OOP / Linux 系统调用 / 网络进阶 / 数据库）串联成一个完整的项目。
+>
+> **项目目标**：实现一个可实际使用的 HTTP/1.1 服务器，支持静态文件、简单 CGI、长连接、多线程 Reactor 架构，能跑 WebBench 压测并达到可观的 QPS。
+>
+> **可选扩展**：在完成基础 HTTP 服务器后，可任选一个方向继续深化：
+> - **方向 A**：升级为 WebSocket 服务器，实现一个实时聊天室。
+> - **方向 B**：加入 MySQL + Redis，实现一个"短链接服务"或"用户系统"。
+> - **方向 C**：实现 HTTP 反向代理 / 负载均衡器。
+
+## 8.1 项目架构设计
+
+- **练习目标**：
+    - 设计一个清晰的项目目录结构（include / src / tests / conf / www / CMakeLists.txt）。
+    - 设计核心模块划分：EventLoop、Channel、Acceptor、TcpConnection、HttpRequest/Response、HttpServer、ThreadPool、Timer、Logger。
+    - 设计类之间的协作关系（UML 或文字描述）。
+    - 制定编码规范（命名、注释、错误处理、日志分级）。
+- **练习任务**：
+    1. 画出项目的模块依赖图：哪些模块是核心 IO 层、哪些是协议层、哪些是业务层。
+    2. 设计 EventLoop 类：封装 epoll fd、事件分发、pending 任务队列、定时器。
+    3. 设计 Channel 类：封装 fd + 关注事件 + 回调（读/写/错误/关闭）。
+    4. 设计 TcpConnection 类：封装连接状态、输入输出缓冲区、HTTP 解析状态机。
+    5. 设计 HttpServer 类：组装所有模块，提供 start / stop 接口。
+- **巩固标准**：
+    - [ ] 能画出"主线程 accept → sub-reactor 读请求 → 线程池处理 → 响应写回"的完整流程。
+    - [ ] 能解释为什么每个连接要绑定到一个 EventLoop（避免跨线程操作 fd 的竞态）。
+    - [ ] 能说出"one loop per thread"的设计哲学（muduo 网络库的核心思想）。
+
+## 8.2 核心模块实现（IO 层）
+
+- **练习目标**：
+    - 实现 EventLoop：epoll_wait 循环、事件分发、 wakeup（eventfd / pipe）、pending 任务执行。
+    - 实现 Channel：事件回调注册、revents 处理、状态机（读就绪 / 写就绪 / 错误 / 挂起）。
+    - 实现 Acceptor：bind + listen + accept，新连接回调给 TcpServer。
+    - 实现 TcpConnection：非阻塞 IO、读写缓冲区、连接生命周期管理。
+- **练习任务**：
+    1. 实现 EventLoop 的最小版本：epoll_wait + Channel 分发。
+    2. 给 EventLoop 加上 `runInLoop()` / `queueInLoop()`，支持跨线程投递任务（eventfd 唤醒）。
+    3. 实现 Acceptor：监听新连接，回调给上层。
+    4. 实现 TcpConnection：读事件 → 读入缓冲区 → 回调；写事件 → 从写缓冲区发送。
+    5. 实现非阻塞 connect + 错误处理（EAGAIN / EINTR / EPIPE / ECONNRESET）。
+- **巩固标准**：
+    - [ ] 能解释 eventfd 相比 pipe 唤醒的优势（一个 fd、语义更清晰）。
+    - [ ] 能处理"写缓冲区满"的情况：注册 EPOLLOUT，写完再取消。
+    - [ ] 能正确管理 TcpConnection 的生命周期（`std::shared_ptr` + `std::enable_shared_from_this`）。
+
+## 8.3 HTTP 协议层实现
+
+- **练习目标**：
+    - 实现 HTTP 请求解析的状态机（解析请求行 → Header → Body）。
+    - 实现 HTTP 响应的构造（状态行、Header、Body）。
+    - 实现静态文件处理：读取文件、返回 200 / 404 / 403，支持 Range 请求（可选）。
+    - 实现 HEAD 方法、OPTIONS 方法。
+- **练习任务**：
+    1. 实现 HttpRequest 类：解析状态机（Uninitialized / ParsingRequestLine / ParsingHeaders / ParsingBody / Complete）。
+    2. 实现 HttpResponse 类：设置状态码、Header、Body，序列化为字节流。
+    3. 实现静态文件处理器：根据 URI 找到 www 目录下的文件，返回内容 + MIME。
+    4. 实现 404 / 400 / 500 等错误页面。
+    5. 处理 POST 请求：解析 Body，返回 echo 响应。
+- **巩固标准**：
+    - [ ] 能处理"请求行过长"、"Header 过多"等异常情况，返回 400。
+    - [ ] 能实现 HTTP 解析的"零拷贝"优化（直接在缓冲区上解析，不额外拷贝）。
+    - [ ] 能处理 URL 解码（%xx 转义、+ 转空格）。
+
+## 8.4 多线程 Reactor 与定时器
+
+- **练习目标**：
+    - 实现主从 Reactor 模型：main-reactor 只负责 accept，sub-reactor 负责 IO。
+    - 实现线程池：任务队列 + 条件变量 + worker 线程。
+    - 实现定时器：最小堆 + EventLoop 定时触发（处理超时连接、心跳）。
+- **练习任务**：
+    1. 实现 ThreadPool 类：`addTask()` 投递任务、worker 线程循环取任务执行。
+    2. 实现 TimerQueue：最小堆存 (expire_time, callback)，每次 epoll_wait 后计算下一次超时。
+    3. 把"连接超时检测"接入 TcpConnection：每次活跃更新 expire_time，定时扫描关闭超时连接。
+    4. 把"业务处理"交给线程池：TcpConnection 读完请求后投递给线程池，处理完再写回响应。
+    5. 实现优雅退出：捕获 SIGTERM，停止 accept，等待所有连接空闲或超时。
+- **巩固标准**：
+    - [ ] 能画出"main-reactor → sub-reactor → 线程池"的完整任务流转图。
+    - [ ] 能解释为什么"定时器回调"必须在 EventLoop 线程执行（避免竞态）。
+    - [ ] 能处理"任务执行过程中连接已关闭"的情况（弱引用 / 生命周期检查）。
+
+## 8.5 日志、配置与测试
+
+- **练习目标**：
+    - 实现一个简易日志类：分级（DEBUG / INFO / WARN / ERROR）、带时间戳与线程 ID、异步写入。
+    - 实现配置文件加载：key=value 格式，支持日志级别、端口、线程数、根目录等配置。
+    - 编写单元测试：HTTP 解析器、响应构造器、定时器。
+- **练习任务**：
+    1. 实现 Logger 类：支持 `LOG_DEBUG` / `LOG_INFO` 等宏，输出到文件或 stdout。
+    2. 实现异步日志：日志先入队列，后台线程批量写盘（可选，作为进阶）。
+    3. 实现 Config 类：加载 `server.conf`，提供 `getInt()` / `getString()` 接口。
+    4. 写单元测试：构造各种畸形 HTTP 请求，验证解析器鲁棒性。
+    5. 写集成测试：启动服务器，用 curl 验证各种请求。
+- **巩固标准**：
+    - [ ] 能解释为什么日志要带时间戳、线程 ID、文件名行号。
+    - [ ] 能处理"日志文件过大"的问题（轮转或接入 logrotate）。
+    - [ ] 能说出"单元测试"与"集成测试"的区别与在本项目中的体现。
+
+## 8.6 压测与优化
+
+- **练习目标**：
+    - 掌握 WebBench / wrk / ab 等压测工具的使用。
+    - 能分析压测结果：QPS、延迟分布、错误率。
+    - 能定位性能瓶颈：CPU（热点函数）、IO（系统调用次数）、锁竞争。
+- **练习任务**：
+    1. 用 WebBench 压测静态文件接口，记录 QPS。
+    2. 用 `perf record` + `perf report` 找出 CPU 热点函数。
+    3. 优化方向（任选）：
+        - 引入 `sendfile()` 零拷贝发送静态文件。
+        - 引入 `mmap` + `write` 发送静态文件。
+        - 调整读写缓冲区大小。
+        - 优化锁粒度（减少锁持有时间）。
+    4. 对比优化前后的 QPS 与 CPU 占用。
+    5. 用 `strace -c` 统计系统调用次数，找出可优化点。
+- **巩固标准**：
+    - [ ] 能解释 `sendfile()` 相比 `read + write` 减少的两次数据拷贝。
+    - [ ] 能解释为什么"缓冲区不是越大越好"（内存占用、缓存命中率）。
+    - [ ] 能画出"压测 → 分析 → 优化 → 再压测"的迭代流程。
+
+## 8.7 项目总结与文档
+
+[阶段八 README](../code/stage08/http-server/docs/README.md)
 
 ---

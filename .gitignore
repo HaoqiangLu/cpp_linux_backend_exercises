@@ -38,5 +38,15 @@ Thumbs.db
 # ===== 临时目录（不上传） =====
 tmp/
 
+# ===== 日志文件 =====
+*.log
+
 # ===== Redis 持久化数据（Docker 挂载目录） =====
 code/stage07/7-3-redis/data/
+
+# ===== 压测脚本临时产物（bench/run_bench.sh 生成）=====
+# .server.out 由上面的 *.out 规则已覆盖，这里只补 strace/perf 采样产物
+# *.data.old 是 perf 覆盖同名 .data 时自动留下的旧备份
+**/bench/.strace.*.txt
+**/bench/.perf.*.data
+**/bench/.perf.*.data.old
